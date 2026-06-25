@@ -314,9 +314,9 @@ def build_map_image(grid_x, grid_y, page_w_tiles, page_h_tiles, map_type, sessio
     cropped_img = map_img.crop((crop_left, crop_top, crop_right, crop_bottom))
     return cropped_img
 
-def draw_track_and_credits(image, tracks_points, grid_x, grid_y, page_w_tiles, page_h_tiles):
+def draw_track_and_credits(image, tracks_points, grid_x, grid_y, page_w_tiles, page_h_tiles, scale_factor=1.0):
     """
-    画像上にGPXの軌跡と国土地理院のクレジットを描画する。
+    画像上にGPXの軌跡と国土地理院のクレジットおよび縮尺（スケールバー）を描画する。
     """
     draw = ImageDraw.Draw(image)
     
@@ -340,11 +340,9 @@ def draw_track_and_credits(image, tracks_points, grid_x, grid_y, page_w_tiles, p
             px, py = points_px[0]
             draw.ellipse([px-5, py-5, px+5, py+5], fill=(230, 10, 10, 220))
             
-    # 出典クレジットの描画
-    credit_text = "地図：国土地理院"
-    
     # Windows用の日本語フォントの読み込みを試行
-    font = None
+    font_large = None
+    font_medium = None
     font_paths = [
         "C:\\Windows\\Fonts\\msgothic.ttc",
         "C:\\Windows\\Fonts\\msmincho.ttc",
@@ -353,23 +351,28 @@ def draw_track_and_credits(image, tracks_points, grid_x, grid_y, page_w_tiles, p
     for fp in font_paths:
         if os.path.exists(fp):
             try:
-                font = ImageFont.truetype(fp, 36)
+                font_large = ImageFont.truetype(fp, 36)
+                font_medium = ImageFont.truetype(fp, 28)
                 break
             except Exception:
                 pass
                 
-    if font is None:
-        font = ImageFont.load_default()
+    if font_large is None:
+        font_large = ImageFont.load_default()
+        font_medium = font_large
         
+    # 右下の出典クレジットの描画
+    credit_text = "地図：国土地理院"
+    
     # テキストサイズを取得して右下に配置
     # Pillowのバージョン差異に対応
     try:
-        left, top, right, bottom = draw.textbbox((0, 0), credit_text, font=font)
+        left, top, right, bottom = draw.textbbox((0, 0), credit_text, font=font_large)
         text_w = right - left
         text_h = bottom - top
     except AttributeError:
         # 古いPillow用のフォールバック
-        text_w, text_h = draw.textsize(credit_text, font=font)
+        text_w, text_h = draw.textsize(credit_text, font=font_large)
         
     margin = 20
     rect_padding = 10
@@ -388,7 +391,103 @@ def draw_track_and_credits(image, tracks_points, grid_x, grid_y, page_w_tiles, p
     draw.rectangle(bg_coords, fill=(255, 255, 255, 180), outline=(200, 200, 200, 255), width=1)
     
     # クレジットテキスト描画
-    draw.text((tx, ty), credit_text, fill=(50, 50, 50, 255), font=font)
+    draw.text((tx, ty), credit_text, fill=(50, 50, 50, 255), font=font_large)
+
+    # 左下の縮尺とスケールバーの算出と描画
+    # 縮尺比率の算出
+    scale_denom = int(round(25000.0 / scale_factor))
+    scale_text = f"1:{scale_denom:,}"
+    
+    # 1ピクセルあたりの地上距離（メートル）
+    target_width_m = 0.297 * scale_denom
+    pixel_ground_meter = target_width_m / TARGET_WIDTH
+    
+    # 適切なスケールバーの距離の選択 (目標: 300px程度の長さ)
+    candidates = [10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000]
+    best_candidate = candidates[0]
+    min_diff = float('inf')
+    for c in candidates:
+        w_px = c / pixel_ground_meter
+        if 150 <= w_px <= 500:
+            diff = abs(w_px - 300)
+            if diff < min_diff:
+                min_diff = diff
+                best_candidate = c
+        else:
+            diff = abs(w_px - 300)
+            if diff < min_diff:
+                min_diff = diff
+                best_candidate = c
+                
+    bar_px = best_candidate / pixel_ground_meter
+    
+    if best_candidate >= 1000:
+        bar_text = f"{best_candidate / 1000:.0f} km" if best_candidate % 1000 == 0 else f"{best_candidate / 1000:.1f} km"
+    else:
+        bar_text = f"{best_candidate} m"
+        
+    # テキストサイズ等の取得
+    try:
+        left, top, right, bottom = draw.textbbox((0, 0), scale_text, font=font_large)
+        scale_w = right - left
+        scale_h = bottom - top
+    except AttributeError:
+        scale_w, scale_h = draw.textsize(scale_text, font=font_large)
+        
+    try:
+        left, top, right, bottom = draw.textbbox((0, 0), bar_text, font=font_medium)
+        bar_text_w = right - left
+        bar_text_h = bottom - top
+    except AttributeError:
+        bar_text_w, bar_text_h = draw.textsize(bar_text, font=font_medium)
+        
+    left_margin = 20
+    left_padding = 15
+    
+    # 全体の幅と高さの計算
+    content_width = max(scale_w, bar_px, bar_text_w)
+    box_width = content_width + left_padding * 2
+    
+    # 縦方向レイアウト:
+    # 縮尺比率テキスト + 間隔(10) + スケールバーテキスト + 間隔(5) + スケールバー領域(10px) + 余白
+    box_height = scale_h + 10 + bar_text_h + 5 + 10 + left_padding * 2
+    
+    box_left = left_margin
+    box_bottom = TARGET_HEIGHT - left_margin
+    box_top = box_bottom - box_height
+    box_right = box_left + box_width
+    
+    # 背景の白い半透明四角形
+    left_bg_coords = [
+        box_left,
+        box_top,
+        box_right,
+        box_bottom
+    ]
+    draw.rectangle(left_bg_coords, fill=(255, 255, 255, 180), outline=(200, 200, 200, 255), width=1)
+    
+    # 1. 縮尺値テキスト描画
+    scale_x = box_left + left_padding
+    scale_y = box_top + left_padding
+    draw.text((scale_x, scale_y), scale_text, fill=(50, 50, 50, 255), font=font_large)
+    
+    # 2. スケールバーテキスト描画 (中央揃え)
+    bar_center_x = box_left + left_padding + bar_px / 2
+    bar_text_x = bar_center_x - bar_text_w / 2
+    bar_text_y = scale_y + scale_h + 10
+    draw.text((bar_text_x, bar_text_y), bar_text, fill=(50, 50, 50, 255), font=font_medium)
+    
+    # 3. スケールバーの線描画
+    bar_line_y = bar_text_y + bar_text_h + 5
+    bar_start_x = box_left + left_padding
+    bar_end_x = bar_start_x + bar_px
+    
+    # メイン横線
+    draw.line(((bar_start_x, bar_line_y), (bar_end_x, bar_line_y)), fill=(50, 50, 50, 255), width=3)
+    # 左縦線
+    draw.line(((bar_start_x, bar_line_y - 5), (bar_start_x, bar_line_y + 5)), fill=(50, 50, 50, 255), width=3)
+    # 右縦線
+    draw.line(((bar_end_x, bar_line_y - 5), (bar_end_x, bar_line_y + 5)), fill=(50, 50, 50, 255), width=3)
 
 def generate_pdf(gpx_data: bytes, map_type: str = "std", scale_factor: float = 1.0, overlap: float = 0.5) -> bytes:
     """
@@ -429,7 +528,7 @@ def generate_pdf(gpx_data: bytes, map_type: str = "std", scale_factor: float = 1
             a4_img = map_img.resize((TARGET_WIDTH, TARGET_HEIGHT), Image.Resampling.LANCZOS)
             
             # 軌跡とクレジットを描画
-            draw_track_and_credits(a4_img, tracks_points, grid_x, grid_y, page_w_tiles, page_h_tiles)
+            draw_track_and_credits(a4_img, tracks_points, grid_x, grid_y, page_w_tiles, page_h_tiles, scale_factor)
             
             # PDF用にRGBモードに変換（PDF保存時はアルファチャンネル不可のため背景白で合成）
             pdf_page = Image.new("RGB", (TARGET_WIDTH, TARGET_HEIGHT), (255, 255, 255))
