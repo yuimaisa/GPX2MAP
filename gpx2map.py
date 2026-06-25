@@ -181,19 +181,35 @@ def calculate_grids(tracks_points, scale_factor=1.0, overlap=0.5):
     step_w = max(1.0, page_w_tiles - overlap)
     step_h = max(1.0, page_h_tiles - overlap)
     
-    # グリッドの開始位置をトラックの最小値より少し外側に設定（マージン）
-    start_x = math.floor(min_x) - 1.0
-    end_x = math.ceil(max_x) + 1.0
-    start_y = math.floor(min_y) - 1.0
-    end_y = math.ceil(max_y) + 1.0
+    W = max_x - min_x
+    H = max_y - min_y
+    
+    # 必要なページ数を計算
+    if W <= page_w_tiles:
+        n_w = 1
+    else:
+        n_w = math.ceil((W - page_w_tiles) / step_w) + 1
+        
+    if H <= page_h_tiles:
+        n_h = 1
+    else:
+        n_h = math.ceil((H - page_h_tiles) / step_h) + 1
+        
+    # グリッド全体がカバーする合計幅と高さ
+    total_w = (n_w - 1) * step_w + page_w_tiles
+    total_h = (n_h - 1) * step_h + page_h_tiles
+    
+    # トラック全体の中心とグリッド全体の中心を一致させるように開始位置を計算
+    start_x = min_x + (W - total_w) / 2
+    start_y = min_y + (H - total_h) / 2
     
     grids = []
     
-    # 格子状に走査
-    curr_y = start_y
-    while curr_y < end_y:
-        curr_x = start_x
-        while curr_x < end_x:
+    for i in range(n_h):
+        curr_y = start_y + i * step_h
+        for j in range(n_w):
+            curr_x = start_x + j * step_w
+            
             # このグリッド領域にトラックが交差するか判定
             intersects = False
             for segment in all_tile_coords:
@@ -202,19 +218,45 @@ def calculate_grids(tracks_points, scale_factor=1.0, overlap=0.5):
                         intersects = True
                         break
                 else:
-                    for i in range(len(segment) - 1):
-                        if is_segment_intersecting_grid(segment[i], segment[i+1], curr_x, curr_y, page_w_tiles, page_h_tiles):
+                    for k in range(len(segment) - 1):
+                        if is_segment_intersecting_grid(segment[k], segment[k+1], curr_x, curr_y, page_w_tiles, page_h_tiles):
                             intersects = True
                             break
                     if intersects:
                         break
             
             if intersects:
-                grids.append((curr_x, curr_y))
+                # このグリッドに含まれるトラックポイントを抽出
+                points_in_grid = []
+                for segment in all_tile_coords:
+                    for tx, ty in segment:
+                        if curr_x <= tx <= curr_x + page_w_tiles and curr_y <= ty <= curr_y + page_h_tiles:
+                            points_in_grid.append((tx, ty))
+                            
+                if points_in_grid:
+                    xs_p = [pt[0] for pt in points_in_grid]
+                    ys_p = [pt[1] for pt in points_in_grid]
+                    min_x_p, max_x_p = min(xs_p), max(xs_p)
+                    min_y_p, max_y_p = min(ys_p), max(ys_p)
+                    
+                    w_p = max_x_p - min_x_p
+                    h_p = max_y_p - min_y_p
+                    
+                    # 含まれる範囲がページサイズ以下であれば、その中心にグリッドをシフト
+                    if w_p <= page_w_tiles and h_p <= page_h_tiles:
+                        cx = (min_x_p + max_x_p) / 2
+                        cy = (min_y_p + max_y_p) / 2
+                        grid_x = cx - page_w_tiles / 2
+                        grid_y = cy - page_h_tiles / 2
+                    else:
+                        grid_x = curr_x
+                        grid_y = curr_y
+                else:
+                    grid_x = curr_x
+                    grid_y = curr_y
+                    
+                grids.append((grid_x, grid_y))
                 
-            curr_x += step_w
-        curr_y += step_h
-        
     return grids, page_w_tiles, page_h_tiles
 
 def download_tile(x, y, z, map_type, session=None, cache_dir="tile_cache"):
