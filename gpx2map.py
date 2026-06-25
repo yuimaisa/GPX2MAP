@@ -124,14 +124,39 @@ def is_segment_intersecting_grid(p1, p2, gx, gy, gw, gh):
             
     return False
 
-def calculate_grids(tracks_points, scale_factor=1.0):
+def calculate_grids(tracks_points, scale_factor=1.0, overlap=0.5):
     """
     GPXトラックポイント全体を網羅するA4横比率のグリッドを生成し、
     トラックが通過するグリッドセルのリストを返す。
+    S=1.0のときに1:25,000縮尺となるように、緯度から動的にタイル数を決定します。
     """
-    # 1ページあたりのタイル数（DPI 300のA4ピクセル数 3508x2480 を基準に、縮小パラメータSを考慮）
-    page_w_tiles = max(1, int(round((TARGET_WIDTH / scale_factor) / 256)))
-    page_h_tiles = max(1, int(round((TARGET_HEIGHT / scale_factor) / 256)))
+    # 1. すべてのトラックポイントから平均緯度を算出
+    all_lats = []
+    for segment in tracks_points:
+        for lat, lon in segment:
+            all_lats.append(lat)
+            
+    if all_lats:
+        avg_lat = sum(all_lats) / len(all_lats)
+    else:
+        avg_lat = 35.0
+        
+    avg_lat = max(min(avg_lat, 85.0), -85.0)
+    
+    # 2. 平均緯度における1タイルの地上距離 (メートル) を算出
+    # 地球赤道半径 R = 6378137.0m, ズームレベル15
+    R = 6378137.0
+    lat_rad = math.radians(avg_lat)
+    tile_ground_meter = (2.0 * math.pi * R * math.cos(lat_rad)) / (2.0 ** ZOOM_LEVEL)
+    
+    # 3. A4サイズ（横297mm × 縦210mm）でS=1.0時に1:25,000縮尺となるページ幅・高さを決定
+    scale_denom = 25000.0 / scale_factor
+    target_width_m = 0.297 * scale_denom
+    target_height_m = 0.210 * scale_denom
+    
+    # floatのページ幅・高さタイル数
+    page_w_tiles = target_width_m / tile_ground_meter
+    page_h_tiles = target_height_m / tile_ground_meter
     
     # すべてのトラックポイントのタイル座標を計算
     all_tile_coords = []
@@ -152,16 +177,15 @@ def calculate_grids(tracks_points, scale_factor=1.0):
     min_x, max_x = min(xs), max(xs)
     min_y, max_y = min(ys), max(ys)
     
-    # 隣接するページ間の重なり（マージン）を2タイル分とする
-    overlap = 2
-    step_w = max(1, page_w_tiles - overlap)
-    step_h = max(1, page_h_tiles - overlap)
+    # 隣接するページ間の重なり（マージン）
+    step_w = max(1.0, page_w_tiles - overlap)
+    step_h = max(1.0, page_h_tiles - overlap)
     
     # グリッドの開始位置をトラックの最小値より少し外側に設定（マージン）
-    start_x = math.floor(min_x) - 1
-    end_x = math.ceil(max_x) + 1
-    start_y = math.floor(min_y) - 1
-    end_y = math.ceil(max_y) + 1
+    start_x = math.floor(min_x) - 1.0
+    end_x = math.ceil(max_x) + 1.0
+    start_y = math.floor(min_y) - 1.0
+    end_y = math.ceil(max_y) + 1.0
     
     grids = []
     
@@ -258,17 +282,37 @@ def download_tile(x, y, z, map_type, session=None, cache_dir="tile_cache"):
 def build_map_image(grid_x, grid_y, page_w_tiles, page_h_tiles, map_type, session=None):
     """
     指定されたグリッド範囲のタイル画像を結合し、1枚の大きな画像を作成する。
+    grid_x, grid_y, page_w_tiles, page_h_tiles は浮動小数点数も許容し、
+    切り出しを行って正確なスケールを実現する。
     """
-    map_img = Image.new("RGBA", (page_w_tiles * 256, page_h_tiles * 256), (255, 255, 255, 255))
+    # 必要な整数のタイル座標範囲を特定
+    start_tile_x = math.floor(grid_x)
+    end_tile_x = math.ceil(grid_x + page_w_tiles)
+    start_tile_y = math.floor(grid_y)
+    end_tile_y = math.ceil(grid_y + page_h_tiles)
     
-    for dy in range(page_h_tiles):
-        for dx in range(page_w_tiles):
-            tx = grid_x + dx
-            ty = grid_y + dy
+    num_tiles_x = end_tile_x - start_tile_x
+    num_tiles_y = end_tile_y - start_tile_y
+    
+    # 結合用の大きなキャンバスを作成
+    map_img = Image.new("RGBA", (num_tiles_x * 256, num_tiles_y * 256), (255, 255, 255, 255))
+    
+    for dy in range(num_tiles_y):
+        for dx in range(num_tiles_x):
+            tx = start_tile_x + dx
+            ty = start_tile_y + dy
             tile = download_tile(tx, ty, ZOOM_LEVEL, map_type, session=session)
             map_img.paste(tile, (dx * 256, dy * 256))
             
-    return map_img
+    # float座標に基づいて、正確な切り出し位置をピクセル単位で計算
+    crop_left = round((grid_x - start_tile_x) * 256)
+    crop_top = round((grid_y - start_tile_y) * 256)
+    crop_right = round((grid_x + page_w_tiles - start_tile_x) * 256)
+    crop_bottom = round((grid_y + page_h_tiles - start_tile_y) * 256)
+    
+    # 切り出した画像は正確に page_w_tiles * 256 x page_h_tiles * 256 に近いサイズになる
+    cropped_img = map_img.crop((crop_left, crop_top, crop_right, crop_bottom))
+    return cropped_img
 
 def draw_track_and_credits(image, tracks_points, grid_x, grid_y, page_w_tiles, page_h_tiles):
     """
@@ -346,7 +390,7 @@ def draw_track_and_credits(image, tracks_points, grid_x, grid_y, page_w_tiles, p
     # クレジットテキスト描画
     draw.text((tx, ty), credit_text, fill=(50, 50, 50, 255), font=font)
 
-def generate_pdf(gpx_data: bytes, map_type: str = "std", scale_factor: float = 1.0) -> bytes:
+def generate_pdf(gpx_data: bytes, map_type: str = "std", scale_factor: float = 1.0, overlap: float = 0.5) -> bytes:
     """
     GPXデータのバイト列を受け取り、A4横マルチページPDFを生成して、そのPDFデータのバイト列を返す。
     WebアプリおよびCLIから共通利用されるコア関数。
@@ -357,13 +401,13 @@ def generate_pdf(gpx_data: bytes, map_type: str = "std", scale_factor: float = 1
         raise ValueError("有効なGPX軌跡データがありませんでした。")
         
     # 2. グリッドセルの計算
-    grids, page_w_tiles, page_h_tiles = calculate_grids(tracks_points, scale_factor)
+    grids, page_w_tiles, page_h_tiles = calculate_grids(tracks_points, scale_factor, overlap)
     if not grids:
         raise ValueError("トラックを包含する地図範囲の計算に失敗しました。")
         
     # 安全装置: 合計ダウンロードタイル数のチェック
-    total_tiles = len(grids) * page_w_tiles * page_h_tiles
-    print(f"情報: 生成ページ数={len(grids)}, 1ページあたりのタイル数={page_w_tiles}x{page_h_tiles} ({page_w_tiles*page_h_tiles}枚)")
+    total_tiles = len(grids) * math.ceil(page_w_tiles) * math.ceil(page_h_tiles)
+    print(f"情報: 生成ページ数={len(grids)}, 1ページあたりのタイル数={page_w_tiles:.1f}x{page_h_tiles:.1f} (約{page_w_tiles*page_h_tiles:.1f}枚)")
     print(f"情報: 想定ダウンロード最大タイル数 = {total_tiles} 枚")
     
     # 1回の処理で500タイルを超える場合はウェイト制御の警告を出しつつ、進行
@@ -418,6 +462,7 @@ def main():
     parser.add_argument("-i", "--input", required=True, help="入力GPXファイルのパス")
     parser.add_argument("-o", "--output", default="output.pdf", help="出力PDFファイルのパス (デフォルト: output.pdf)")
     parser.add_argument("-s", "--scale", type=float, default=1.0, help="縮小パラメータ (0.1〜1.0, デフォルト: 1.0)")
+    parser.add_argument("-m", "--margin", type=float, default=0.5, help="隣接ページとの重複マージン（タイル数、デフォルト: 0.5）")
     parser.add_argument("-t", "--type", choices=["std", "pale", "seamlessphoto"], default="std", 
                         help="地図の種類: std(標準地図), pale(淡色地図), seamlessphoto(シームレス空中写真) (デフォルト: std)")
                         
@@ -431,13 +476,17 @@ def main():
         print("エラー: 縮小パラメータ --scale は 0.01 以上である必要があります。")
         return
         
+    if args.margin < 0.0:
+        print("エラー: 重複マージン --margin は 0.0 以上である必要があります。")
+        return
+        
     print(f"解析中: {args.input}")
     try:
         with open(args.input, "rb") as f:
             gpx_data = f.read()
             
         print("PDF生成処理を開始します。しばらくお待ちください...")
-        pdf_data = generate_pdf(gpx_data, args.type, args.scale)
+        pdf_data = generate_pdf(gpx_data, args.type, args.scale, args.margin)
         
         with open(args.output, "wb") as out_f:
             out_f.write(pdf_data)
