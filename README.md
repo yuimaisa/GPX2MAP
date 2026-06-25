@@ -48,3 +48,9 @@ python gpx2map.py -i <入力GPXファイル> -o <出力PDFファイル> [オプ�
    ```bash
    python gpx2map.py -i sample.gpx -o output_std.pdf -m 0.2
    ```
+
+   
+### 出力例
+
+   <img width="840" height="591" alt="image" src="https://github.com/user-attachments/assets/b0c48d82-a779-4029-8568-7eb444d1c709" />
+
