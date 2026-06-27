@@ -34,6 +34,7 @@ ensure_font_installed()
 # UIの構築
 st.title("GPX2MAP")
 st.write("GPXファイルをアップロードすると、PDF地図が作成されます。")
+st.write("利用方法: <https://github.com/yuimaisa/GPX2MAP>")
 
 uploaded_file = st.file_uploader("Upload GPX file", type=["gpx"])
 
