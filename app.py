@@ -84,3 +84,8 @@ if uploaded_file is not None:
                 
             except Exception as e:
                 st.error(f"Error during PDF generation: {e}")
+
+
+# フッター
+st.divider()
+st.caption("[yuimaisa](https://zetekton.com/ja/members/yuishinwada)")
