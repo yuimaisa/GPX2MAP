@@ -2,7 +2,7 @@
 title: GPX2MAP
 emoji: 🗺
 colorFrom: gray
-colorTo: black
+colorTo: green
 sdk: streamlit
 sdk_version: "1.30.0"
 app_file: app.py
