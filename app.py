@@ -88,4 +88,4 @@ if uploaded_file is not None:
 
 # フッター
 st.divider()
-st.caption("[yuimaisa](https://zetekton.com/ja/members/yuishinwada)")
+st.caption("Developed by [yuimaisa](https://zetekton.com/ja/members/yuishinwada)")
