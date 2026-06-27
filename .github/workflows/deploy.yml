@@ -14,4 +14,4 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          git push --force https://ご自身のHFユーザー名:$HF_TOKEN@huggingface.co/spaces/ご自身のHFユーザー名/gpx2map main
+          git push --force https://yuishin:$HF_TOKEN@huggingface.co/spaces/yuishin/gpx2map main
