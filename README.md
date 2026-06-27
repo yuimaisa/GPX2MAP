@@ -1,3 +1,14 @@
+---
+title: GPX2MAP
+emoji: 🗺
+colorFrom: gray
+colorTo: black
+sdk: streamlit
+sdk_version: "1.30.0"
+app_file: app.py
+pinned: false
+---
+
 # GPX2MAP
 
 GPXデータを読み込み、国土地理院の地図上にトラックを重ね合わせて、A4横サイズのPDFファイルとして出力するPythonアプリケーションです。

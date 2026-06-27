@@ -22,6 +22,7 @@ jobs:
           cp app.py /tmp/hf_deploy/
           cp gpx2map.py /tmp/hf_deploy/
           cp requirements.txt /tmp/hf_deploy/
+          cp README.md /tmp/hf_deploy/
           
           # 新規にGitリポジトリを初期化してコミット
           cd /tmp/hf_deploy
