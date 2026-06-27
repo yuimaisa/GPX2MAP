@@ -14,4 +14,20 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
+          git config --global user.email "action@github.com"
+          git config --global user.name "GitHub Action"
+          
+          # デプロイ用の一時フォルダを作成し、必要なソースファイルだけをコピー
+          mkdir -p /tmp/hf_deploy
+          cp app.py /tmp/hf_deploy/
+          cp gpx2map.py /tmp/hf_deploy/
+          cp requirements.txt /tmp/hf_deploy/
+          
+          # 新規にGitリポジトリを初期化してコミット
+          cd /tmp/hf_deploy
+          git init -b main
+          git add .
+          git commit -m "Deploy clean source files from GitHub Actions"
+          
+          # 強制プッシュ
           git push --force https://yuishin:$HF_TOKEN@huggingface.co/spaces/yuishin/gpx2map main
