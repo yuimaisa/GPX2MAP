@@ -4,3 +4,4 @@
 *.jpg
 __pycache__/
 tile_cache/
+fonts/
