@@ -124,7 +124,7 @@ def is_segment_intersecting_grid(p1, p2, gx, gy, gw, gh):
             
     return False
 
-def calculate_grids(tracks_points, scale_factor=1.0, overlap=0.5):
+def calculate_grids(tracks_points, scale_factor=1.0, overlap=0.5, page_margin_mm=5.0):
     """
     GPXトラックポイント全体を網羅するA4横比率のグリッドを生成し、
     トラックが通過するグリッドセルのリストを返す。
@@ -149,10 +149,13 @@ def calculate_grids(tracks_points, scale_factor=1.0, overlap=0.5):
     lat_rad = math.radians(avg_lat)
     tile_ground_meter = (2.0 * math.pi * R * math.cos(lat_rad)) / (2.0 ** ZOOM_LEVEL)
     
-    # 3. A4サイズ（横297mm × 縦210mm）でS=1.0時に1:25,000縮尺となるページ幅・高さを決定
+    # 3. A4サイズ（横297mm × 縦210mm）から余白を除いた印刷可能領域でS=1.0時に1:25,000縮尺となるページ幅・高さを決定
+    printable_width_mm = 297.0 - 2 * page_margin_mm
+    printable_height_mm = 210.0 - 2 * page_margin_mm
+    
     scale_denom = 25000.0 / scale_factor
-    target_width_m = 0.297 * scale_denom
-    target_height_m = 0.210 * scale_denom
+    target_width_m = (printable_width_mm / 1000.0) * scale_denom
+    target_height_m = (printable_height_mm / 1000.0) * scale_denom
     
     # floatのページ幅・高さタイル数
     page_w_tiles = target_width_m / tile_ground_meter
@@ -356,11 +359,13 @@ def build_map_image(grid_x, grid_y, page_w_tiles, page_h_tiles, map_type, sessio
     cropped_img = map_img.crop((crop_left, crop_top, crop_right, crop_bottom))
     return cropped_img
 
-def draw_track_and_credits(image, tracks_points, grid_x, grid_y, page_w_tiles, page_h_tiles, scale_factor=1.0):
+def draw_track_and_credits(image, tracks_points, grid_x, grid_y, page_w_tiles, page_h_tiles, scale_factor=1.0, page_margin_mm=5.0):
     """
     画像上にGPXの軌跡と国土地理院のクレジットおよび縮尺（スケールバー）を描画する。
     """
     draw = ImageDraw.Draw(image)
+    img_w, img_h = image.size
+    printable_width_mm = 297.0 - 2 * page_margin_mm
     
     # GPX軌跡の描画
     # すべてのセグメントごとに線を描く
@@ -368,9 +373,9 @@ def draw_track_and_credits(image, tracks_points, grid_x, grid_y, page_w_tiles, p
         points_px = []
         for lat, lon in segment:
             tx, ty = latlon_to_tile(lat, lon, ZOOM_LEVEL)
-            # A4横サイズ(TARGET_WIDTH x TARGET_HEIGHT)へのマッピング
-            px = (tx - grid_x) / page_w_tiles * TARGET_WIDTH
-            py = (ty - grid_y) / page_h_tiles * TARGET_HEIGHT
+            # 画像サイズへのマッピング
+            px = (tx - grid_x) / page_w_tiles * img_w
+            py = (ty - grid_y) / page_h_tiles * img_h
             points_px.append((px, py))
             
         if len(points_px) >= 2:
@@ -420,15 +425,15 @@ def draw_track_and_credits(image, tracks_points, grid_x, grid_y, page_w_tiles, p
     rect_padding = 10
     
     # クレジットテキストの座標
-    tx = TARGET_WIDTH - text_w - margin - rect_padding
-    ty = TARGET_HEIGHT - text_h - margin - rect_padding
+    tx = img_w - text_w - margin - rect_padding
+    ty = img_h - text_h - margin - rect_padding
     
     # クレジット背景の白い半透明四角形
     bg_coords = [
         tx - rect_padding, 
         ty - rect_padding, 
-        TARGET_WIDTH - margin, 
-        TARGET_HEIGHT - margin
+        img_w - margin, 
+        img_h - margin
     ]
     draw.rectangle(bg_coords, fill=(255, 255, 255, 180), outline=(200, 200, 200, 255), width=1)
     
@@ -441,8 +446,8 @@ def draw_track_and_credits(image, tracks_points, grid_x, grid_y, page_w_tiles, p
     scale_text = f"1:{scale_denom:,}"
     
     # 1ピクセルあたりの地上距離（メートル）
-    target_width_m = 0.297 * scale_denom
-    pixel_ground_meter = target_width_m / TARGET_WIDTH
+    target_width_m = (printable_width_mm / 1000.0) * scale_denom
+    pixel_ground_meter = target_width_m / img_w
     
     # 適切なスケールバーの距離の選択 (目標: 300px程度の長さ)
     candidates = [10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000]
@@ -495,7 +500,7 @@ def draw_track_and_credits(image, tracks_points, grid_x, grid_y, page_w_tiles, p
     box_height = scale_h + 10 + bar_text_h + 5 + 10 + left_padding * 2
     
     box_left = left_margin
-    box_bottom = TARGET_HEIGHT - left_margin
+    box_bottom = img_h - left_margin
     box_top = box_bottom - box_height
     box_right = box_left + box_width
     
@@ -531,18 +536,23 @@ def draw_track_and_credits(image, tracks_points, grid_x, grid_y, page_w_tiles, p
     # 右縦線
     draw.line(((bar_end_x, bar_line_y - 5), (bar_end_x, bar_line_y + 5)), fill=(50, 50, 50, 255), width=3)
 
-def generate_pdf(gpx_data: bytes, map_type: str = "std", scale_factor: float = 1.0, overlap: float = 0.5) -> bytes:
+def generate_pdf(gpx_data: bytes, map_type: str = "std", scale_factor: float = 1.0, overlap: float = 0.5, page_margin_mm: float = 5.0) -> bytes:
     """
     GPXデータのバイト列を受け取り、A4横マルチページPDFを生成して、そのPDFデータのバイト列を返す。
     WebアプリおよびCLIから共通利用されるコア関数。
     """
-    # 1. GPXデータのパース
+    # 1. 余白（ピクセル数）と印刷可能領域の計算
+    margin_px = int(round(page_margin_mm * (300.0 / 25.4)))
+    printable_width = TARGET_WIDTH - 2 * margin_px
+    printable_height = TARGET_HEIGHT - 2 * margin_px
+    
+    # 2. GPXデータのパース
     tracks_points = parse_gpx(gpx_data)
     if not tracks_points or not any(tracks_points):
         raise ValueError("有効なGPX軌跡データがありませんでした。")
         
-    # 2. グリッドセルの計算
-    grids, page_w_tiles, page_h_tiles = calculate_grids(tracks_points, scale_factor, overlap)
+    # 3. グリッドセルの計算
+    grids, page_w_tiles, page_h_tiles = calculate_grids(tracks_points, scale_factor, overlap, page_margin_mm)
     if not grids:
         raise ValueError("トラックを包含する地図範囲の計算に失敗しました。")
         
@@ -557,7 +567,7 @@ def generate_pdf(gpx_data: bytes, map_type: str = "std", scale_factor: float = 1
         
     pages = []
     
-    # 3. セッションを利用して接続を使い回す
+    # 4. セッションを利用して接続を使い回す
     with requests.Session() as session:
         for idx, (grid_x, grid_y) in enumerate(grids):
             print(f"進捗: ページ {idx + 1} / {len(grids)} の地図画像を構築中... (タイル基準左上: {grid_x}, {grid_y})")
@@ -565,16 +575,16 @@ def generate_pdf(gpx_data: bytes, map_type: str = "std", scale_factor: float = 1
             # タイル画像を結合
             map_img = build_map_image(grid_x, grid_y, page_w_tiles, page_h_tiles, map_type, session=session)
             
-            # A4ターゲット解像度（3508 x 2480）にリサイズ
+            # 印刷可能領域の解像度にリサイズ
             # 高品質リサンプリングフィルター（LANCZOS）を使用
-            a4_img = map_img.resize((TARGET_WIDTH, TARGET_HEIGHT), Image.Resampling.LANCZOS)
+            printable_img = map_img.resize((printable_width, printable_height), Image.Resampling.LANCZOS)
             
             # 軌跡とクレジットを描画
-            draw_track_and_credits(a4_img, tracks_points, grid_x, grid_y, page_w_tiles, page_h_tiles, scale_factor)
+            draw_track_and_credits(printable_img, tracks_points, grid_x, grid_y, page_w_tiles, page_h_tiles, scale_factor, page_margin_mm)
             
             # PDF用にRGBモードに変換（PDF保存時はアルファチャンネル不可のため背景白で合成）
             pdf_page = Image.new("RGB", (TARGET_WIDTH, TARGET_HEIGHT), (255, 255, 255))
-            pdf_page.paste(a4_img, mask=a4_img.split()[3]) # アルファチャンネルをマスクとして使用
+            pdf_page.paste(printable_img, (margin_px, margin_px), mask=printable_img.split()[3]) # アルファチャンネルをマスクとして使用
             
             pages.append(pdf_page)
             
@@ -586,7 +596,7 @@ def generate_pdf(gpx_data: bytes, map_type: str = "std", scale_factor: float = 1
     if not pages:
         raise ValueError("PDFページの生成に失敗しました。")
         
-    # 4. PillowのマルチページPDF書き出し機能を使用してバイトデータに変換
+    # 5. PillowのマルチページPDF書き出し機能を使用してバイトデータに変換
     pdf_buffer = io.BytesIO()
     pages[0].save(
         pdf_buffer,
@@ -606,6 +616,7 @@ def main():
     parser.add_argument("-m", "--margin", type=float, default=0.5, help="隣接ページとの重複マージン（タイル数、デフォルト: 0.5）")
     parser.add_argument("-t", "--type", choices=["std", "pale", "seamlessphoto"], default="std", 
                         help="地図の種類: std(標準地図), pale(淡色地図), seamlessphoto(シームレス空中写真) (デフォルト: std)")
+    parser.add_argument("--page-margin", type=float, default=5.0, help="印刷用の余白 (mm, デフォルト: 5.0)")
                         
     args = parser.parse_args()
     
@@ -621,13 +632,17 @@ def main():
         print("エラー: 重複マージン --margin は 0.0 以上である必要があります。")
         return
         
+    if not (0.0 <= args.page_margin < 100.0):
+        print("エラー: 印刷用の余白 --page-margin は 0.0 以上 100.0 未満である必要があります。")
+        return
+        
     print(f"解析中: {args.input}")
     try:
         with open(args.input, "rb") as f:
             gpx_data = f.read()
             
         print("PDF生成処理を開始します。しばらくお待ちください...")
-        pdf_data = generate_pdf(gpx_data, args.type, args.scale, args.margin)
+        pdf_data = generate_pdf(gpx_data, args.type, args.scale, args.margin, args.page_margin)
         
         with open(args.output, "wb") as out_f:
             out_f.write(pdf_data)
