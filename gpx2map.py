@@ -262,11 +262,14 @@ def calculate_grids(tracks_points, scale_factor=1.0, overlap=0.5, page_margin_mm
                 
     return grids, page_w_tiles, page_h_tiles
 
-def download_tile(x, y, z, map_type, session=None, cache_dir="tile_cache"):
+def download_tile(x, y, z, map_type, session=None, cache_dir=None):
     """
     国土地理院からタイルをダウンロードする。ローカルキャッシュを優先し、
     新規リクエスト時はセッションを使い回し、かつリトライ機構（指数バックオフ）で接続を安定化させる。
     """
+    if cache_dir is None:
+        cache_dir = os.environ.get("GPX2MAP_CACHE_DIR", "tile_cache")
+        
     # 座標の検証 (ズーム15のタイル範囲チェック)
     max_tile_idx = 2**z - 1
     if not (0 <= x <= max_tile_idx and 0 <= y <= max_tile_idx):
@@ -387,10 +390,13 @@ def draw_track_and_credits(image, tracks_points, grid_x, grid_y, page_w_tiles, p
             px, py = points_px[0]
             draw.ellipse([px-5, py-5, px+5, py+5], fill=(230, 10, 10, 220))
             
-    # Windows用の日本語フォントの読み込みを試行
+    # 日本語フォントの読み込みを試行
     font_large = None
     font_medium = None
+    local_font_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
     font_paths = [
+        os.path.join(local_font_dir, "NotoSansJP-Regular.otf"),
+        os.path.join(local_font_dir, "NotoSansJP-Regular.ttf"),
         "C:\\Windows\\Fonts\\msgothic.ttc",
         "C:\\Windows\\Fonts\\msmincho.ttc",
         "C:\\Windows\\Fonts\\meiryo.ttc"
