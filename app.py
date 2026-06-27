@@ -57,7 +57,7 @@ with col2:
 if uploaded_file is not None:
     gpx_data = uploaded_file.read()
     
-    if st.button("Generate PDF Map", type="primary"):
+    if st.button("PDFを生成(時間がかかります！)", type="primary"):
         with st.spinner("Downloading tiles and generating PDF..."):
             try:
                 # 一時フォルダをキャッシュディレクトリとして設定し、書き込み権限エラーを防ぐ
