@@ -28,7 +28,7 @@ Hugging Face: <https://huggingface.co/spaces/yuishin/gpx2map>
 
 ### 利用方法
 
-[Hugging Face](https://huggingface.co/spaces/yuishin/gpx2map) にアクセスし、gpxファイルをアップロードしてください。Generate PDF Mapボタンを押すと処理が始まります。かなり時間がかかります。
+[Hugging Face](https://huggingface.co/spaces/yuishin/gpx2map) にアクセスし、gpxファイルをアップロードしてください。「PDFを生成」ボタンを押すと処理が始まります。かなり時間がかかります。
 
 ローカルでの実行方法は下記を参照してください。
 
