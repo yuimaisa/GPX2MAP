@@ -114,6 +114,13 @@ with col2:
         on_change=reset_generation_state,
         disabled=st.session_state.generating
     )
+    draw_magnetic_north = st.checkbox(
+        "磁北線を描画する",
+        value=False,
+        key="draw_magnetic_north_check",
+        on_change=reset_generation_state,
+        disabled=st.session_state.generating
+    )
 
 if uploaded_file is not None:
     gpx_data = uploaded_file.read()
@@ -138,7 +145,8 @@ if uploaded_file is not None:
                         map_type=map_type,
                         scale_factor=scale_factor,
                         overlap=overlap,
-                        page_margin_mm=page_margin
+                        page_margin_mm=page_margin,
+                        draw_magnetic_north=draw_magnetic_north
                     )
                 
                 st.session_state.pdf_bytes = pdf_bytes

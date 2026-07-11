@@ -6,6 +6,8 @@ import argparse
 import requests
 import gpxpy
 from PIL import Image, ImageDraw, ImageFont
+import datetime
+import xml.etree.ElementTree as ET
 
 # 地理院タイルのURL定義
 MAP_URLS = {
@@ -20,6 +22,39 @@ TARGET_HEIGHT = 2480
 ASPECT_RATIO = TARGET_WIDTH / TARGET_HEIGHT # 約1.4145
 
 ZOOM_LEVEL = 15 # 等高線10mが描画される解像度固定
+
+def fetch_magnetic_declination(lat, lon, year):
+    """
+    国土地理院の地磁気値計算API等から磁気偏角を取得する。
+    """
+    url = "https://vldb.gsi.go.jp/sokuchi/geomag/math/cgimath/sigmath_m.cgi"
+    params = {
+        "use_of_data": "xml",
+        "year": year,
+        "month": 1,
+        "day": 1,
+        "lat": lat,
+        "lon": lon,
+        "alt": 0
+    }
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        
+        # XML解析
+        root = ET.fromstring(response.content)
+        dec_str = root.findtext(".//declination")
+        if dec_str:
+            if "°" in dec_str:
+                parts = dec_str.split("°")
+                deg = float(parts[0])
+                min_str = parts[1].replace("'", "").replace("′", "")
+                return deg + float(min_str) / 60.0
+            return float(dec_str)
+    except Exception as e:
+        print(f"警告: 磁気偏角の取得に失敗しました。プログラムは続行します。({e})")
+    
+    return None
 
 def latlon_to_tile(lat, lon, zoom=ZOOM_LEVEL):
     """
@@ -362,13 +397,36 @@ def build_map_image(grid_x, grid_y, page_w_tiles, page_h_tiles, map_type, sessio
     cropped_img = map_img.crop((crop_left, crop_top, crop_right, crop_bottom))
     return cropped_img
 
-def draw_track_and_credits(image, tracks_points, grid_x, grid_y, page_w_tiles, page_h_tiles, scale_factor=1.0, page_margin_mm=5.0):
+def draw_track_and_credits(image, tracks_points, grid_x, grid_y, page_w_tiles, page_h_tiles, scale_factor=1.0, page_margin_mm=5.0, declination=None):
     """
     画像上にGPXの軌跡と国土地理院のクレジットおよび縮尺（スケールバー）を描画する。
     """
     draw = ImageDraw.Draw(image)
     img_w, img_h = image.size
     printable_width_mm = 297.0 - 2 * page_margin_mm
+    
+    # 磁北線の描画 (赤線)
+    if declination is not None:
+        # 西偏を正として、上方向(真北)から反時計回りに回転
+        angle_rad = math.radians(abs(declination))
+        spacing = 800  # 線の間隔(ピクセル)
+        diag = math.hypot(img_w, img_h)
+        cx, cy = img_w / 2, img_h / 2
+        
+        for offset in range(-int(diag), int(diag), spacing):
+            # 垂直線に対する法線方向にオフセットを移動
+            base_x = cx + offset * math.cos(angle_rad)
+            base_y = cy - offset * math.sin(angle_rad)
+            
+            # 線分の方向ベクトル (上下にdiag伸ばす)
+            dx = math.sin(angle_rad) * diag
+            dy = math.cos(angle_rad) * diag
+            
+            # Y軸は下方向が正であるため、北方向は -dy、南方向は +dy
+            x1, y1 = base_x - dx, base_y - dy
+            x2, y2 = base_x + dx, base_y + dy
+            
+            draw.line([(x1, y1), (x2, y2)], fill=(255, 50, 50, 150), width=3)
     
     # GPX軌跡の描画
     # すべてのセグメントごとに線を描く
@@ -542,7 +600,7 @@ def draw_track_and_credits(image, tracks_points, grid_x, grid_y, page_w_tiles, p
     # 右縦線
     draw.line(((bar_end_x, bar_line_y - 5), (bar_end_x, bar_line_y + 5)), fill=(50, 50, 50, 255), width=3)
 
-def generate_pdf(gpx_data: bytes, map_type: str = "std", scale_factor: float = 1.0, overlap: float = 0.5, page_margin_mm: float = 5.0) -> bytes:
+def generate_pdf(gpx_data: bytes, map_type: str = "std", scale_factor: float = 1.0, overlap: float = 0.5, page_margin_mm: float = 5.0, draw_magnetic_north: bool = False) -> bytes:
     """
     GPXデータのバイト列を受け取り、A4横マルチページPDFを生成して、そのPDFデータのバイト列を返す。
     WebアプリおよびCLIから共通利用されるコア関数。
@@ -561,6 +619,23 @@ def generate_pdf(gpx_data: bytes, map_type: str = "std", scale_factor: float = 1
     grids, page_w_tiles, page_h_tiles = calculate_grids(tracks_points, scale_factor, overlap, page_margin_mm)
     if not grids:
         raise ValueError("トラックを包含する地図範囲の計算に失敗しました。")
+        
+    # 磁北線フラグが有効な場合、中心座標を求めて偏角を取得
+    declination = None
+    if draw_magnetic_north:
+        all_lats = []
+        all_lons = []
+        for segment in tracks_points:
+            for lat, lon in segment:
+                all_lats.append(lat)
+                all_lons.append(lon)
+        if all_lats and all_lons:
+            center_lat = sum(all_lats) / len(all_lats)
+            center_lon = sum(all_lons) / len(all_lons)
+            current_year = datetime.datetime.now().year
+            declination = fetch_magnetic_declination(center_lat, center_lon, current_year)
+            if declination is not None:
+                print(f"情報: 磁気偏角を取得しました: {declination:.2f}度")
         
     # 安全装置: 合計ダウンロードタイル数のチェック
     total_tiles = len(grids) * math.ceil(page_w_tiles) * math.ceil(page_h_tiles)
@@ -586,7 +661,7 @@ def generate_pdf(gpx_data: bytes, map_type: str = "std", scale_factor: float = 1
             printable_img = map_img.resize((printable_width, printable_height), Image.Resampling.LANCZOS)
             
             # 軌跡とクレジットを描画
-            draw_track_and_credits(printable_img, tracks_points, grid_x, grid_y, page_w_tiles, page_h_tiles, scale_factor, page_margin_mm)
+            draw_track_and_credits(printable_img, tracks_points, grid_x, grid_y, page_w_tiles, page_h_tiles, scale_factor, page_margin_mm, declination)
             
             # PDF用にRGBモードに変換（PDF保存時はアルファチャンネル不可のため背景白で合成）
             pdf_page = Image.new("RGB", (TARGET_WIDTH, TARGET_HEIGHT), (255, 255, 255))
@@ -623,6 +698,7 @@ def main():
     parser.add_argument("-t", "--type", choices=["std", "pale", "seamlessphoto"], default="std", 
                         help="地図の種類: std(標準地図), pale(淡色地図), seamlessphoto(シームレス空中写真) (デフォルト: std)")
     parser.add_argument("--page-margin", type=float, default=5.0, help="印刷用の余白 (mm, デフォルト: 5.0)")
+    parser.add_argument("--draw-magnetic-north", action="store_true", help="地図上に磁北線（赤線）を描画する")
                         
     args = parser.parse_args()
     
@@ -648,7 +724,7 @@ def main():
             gpx_data = f.read()
             
         print("PDF生成処理を開始します。しばらくお待ちください...")
-        pdf_data = generate_pdf(gpx_data, args.type, args.scale, args.margin, args.page_margin)
+        pdf_data = generate_pdf(gpx_data, args.type, args.scale, args.margin, args.page_margin, args.draw_magnetic_north)
         
         with open(args.output, "wb") as out_f:
             out_f.write(pdf_data)
