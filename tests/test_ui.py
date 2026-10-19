@@ -1,4 +1,5 @@
 import io
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -7,7 +8,9 @@ from unittest.mock import patch
 from PIL import Image
 from pypdf import PdfReader
 from streamlit.testing.v1 import AppTest
+from zipfile import ZipFile
 
+from map_plan import DEFAULT_LIMITS
 from tile_store import TileDownloadError
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,6 +19,10 @@ FIXTURES = ROOT / 'tests/fixtures'
 
 def upload(data, name='test-route.gpx'):
     return SimpleNamespace(name=name, size=len(data), getvalue=lambda: data)
+
+
+def download_bytes(app):
+    return b''.join(block.read_bytes() for block in app.session_state['download_artifact'].blocks)
 
 
 class UITests(unittest.TestCase):
@@ -42,11 +49,13 @@ class UITests(unittest.TestCase):
             app.button(key='generate_button').click().run(timeout=20)
             self.assertFalse(app.exception)
             self.assertTrue(app.success)
-            self.assertEqual(len(PdfReader(io.BytesIO(app.session_state['pdf_bytes'])).pages), planned)
+            self.assertEqual(len(PdfReader(io.BytesIO(download_bytes(app))).pages), planned)
             self.assertEqual(app.session_state['pdf_filename'], 'test-route_map.pdf')
+            directory = app.session_state['download_artifact'].directory
             app.selectbox(key='scale_select').select('1:50,000（広い範囲）').run()
             self.assertFalse(app.exception)
-            self.assertIsNone(app.session_state['pdf_bytes'])
+            self.assertIsNone(app.session_state['download_artifact'])
+            self.assertFalse(directory.exists())
             self.assertEqual(app.session_state['generation_plan'].settings.scale_factor, 0.5)
             app.selectbox(key='scale_select').select('その他の縮尺').run()
             app.number_input(key='custom_scale_denominator').set_value(75000).run()
@@ -61,7 +70,8 @@ class UITests(unittest.TestCase):
             self.assertFalse(app.exception)
             self.assertTrue(app.error)
             self.assertFalse(app.success)
-            self.assertIsNone(app.session_state['pdf_bytes'])
+            self.assertIn('HTTP 404', app.session_state['error_details'])
+            self.assertIsNone(app.session_state['download_artifact'])
             self.assertFalse(app.button(key='generate_button').disabled)
             self.assertEqual(len(app.get('download_button')), 0)
             with patch('gpx2map.download_tile', side_effect=lambda *a, **kw: Image.new('RGBA', (256, 256), 'white')):
@@ -79,3 +89,36 @@ class UITests(unittest.TestCase):
             self.assertTrue(app.error)
             self.assertTrue(app.button(key='generate_button').disabled)
             self.assertIsNone(app.session_state['generation_plan'])
+
+    def test_split_download_is_zip_with_global_page_numbers(self):
+        limits = replace(DEFAULT_LIMITS, pdf_bytes=600000)
+        with patch('map_plan.DEFAULT_LIMITS', limits), \
+             patch('streamlit.file_uploader', return_value=upload((FIXTURES / 'coverage_gap.gpx').read_bytes())), \
+             patch('gpx2map.download_tile', side_effect=lambda *a, **kw: Image.new('RGBA', (256, 256), 'white')):
+            app = AppTest.from_file(str(ROOT / 'app.py')).run()
+            app.button(key='generate_button').click().run(timeout=20)
+            self.assertFalse(app.exception)
+            self.assertTrue(app.success)
+            artifact = app.session_state['download_artifact']
+            self.assertTrue(artifact.is_zip)
+            self.assertEqual(artifact.filename, 'test-route_map.zip')
+            with ZipFile(io.BytesIO(download_bytes(app))) as archive:
+                self.assertEqual(len(archive.namelist()), 2)
+                labels = []
+                for entry in archive.infolist():
+                    self.assertLessEqual(entry.file_size, limits.pdf_bytes)
+                    labels.extend(PdfReader(io.BytesIO(archive.read(entry)), strict=True).page_labels)
+                self.assertEqual(labels, ['1', '2'])
+
+    def test_single_page_over_limit_has_no_download_and_can_retry(self):
+        with patch('map_plan.DEFAULT_LIMITS', replace(DEFAULT_LIMITS, pdf_bytes=100)), \
+             patch('streamlit.file_uploader', return_value=upload((FIXTURES / 'sample.gpx').read_bytes())), \
+             patch('gpx2map.download_tile', side_effect=lambda *a, **kw: Image.new('RGBA', (256, 256), 'white')):
+            app = AppTest.from_file(str(ROOT / 'app.py')).run()
+            app.button(key='generate_button').click().run(timeout=20)
+            self.assertFalse(app.exception)
+            self.assertTrue(app.error)
+            self.assertIn('ページ1は1ページだけで', app.session_state['error_message'])
+            self.assertIn('上限100バイト', app.error[0].value)
+            self.assertIsNone(app.session_state['download_artifact'])
+            self.assertFalse(app.button(key='generate_button').disabled)

@@ -3,7 +3,8 @@ import os
 
 import streamlit as st
 
-from gpx2map import build_layout_preview, generate_pdf
+from download_component import DownloadArtifact, show_download
+from gpx2map import build_layout_preview, generate_output
 from map_plan import DEFAULT_LIMITS, GPX2MapError, inspect_gpx, plan_pdf
 from tile_store import TileDownloadError
 from magnetic_north import MagneticNorthError, SPACING_OPTIONS_M
@@ -11,7 +12,7 @@ from magnetic_north import MagneticNorthError, SPACING_OPTIONS_M
 st.set_page_config(page_title='GPX2MAP | 印刷用の地図を作成', layout='centered')
 
 RESULT_DEFAULTS = {
-    'pdf_bytes': None,
+    'download_artifact': None,
     'pdf_filename': 'generated_map.pdf',
     'pdf_summary': None,
     'error_message': None,
@@ -29,10 +30,16 @@ for key, value in STATE_DEFAULTS.items():
 
 
 def reset_generation_state():
-    for key, value in RESULT_DEFAULTS.items():
-        st.session_state[key] = value
+    clear_result()
     st.session_state.generation_plan = None
     st.session_state.plan_key = None
+
+
+def clear_result():
+    if st.session_state.download_artifact is not None:
+        st.session_state.download_artifact.close()
+    for key, value in RESULT_DEFAULTS.items():
+        st.session_state[key] = value
 
 
 def reset_upload_state():
@@ -42,10 +49,21 @@ def reset_upload_state():
 
 
 def start_generation():
-    for key, value in RESULT_DEFAULTS.items():
-        st.session_state[key] = value
+    clear_result()
     st.session_state.generating = True
     st.session_state.run_generation = True
+
+
+def show_result(artifact):
+    # Keep ownership in session_state, so releasing a session also releases files.
+    if artifact.is_zip:
+        st.success(f'容量上限に合わせて{len(artifact.parts)}個のPDFに自動分割しました。ZIPでまとめて保存できます。')
+        st.caption('ZIPを展開し、ファイル名の連番順に印刷してください。ページ番号は全体の通し番号です。')
+    else:
+        st.success('必要な地図タイルを確認し、PDFを作成しました。下のボタンから保存してください。')
+    st.write(st.session_state.pdf_summary)
+    show_download(artifact)
+    st.caption('印刷するときは「A4・横向き・倍率100%」を指定してください。')
 
 
 MAP_LABELS = {'std': '標準地図', 'pale': '淡色地図', 'seamlessphoto': '空中写真'}
@@ -149,7 +167,7 @@ if document is not None:
         if st.session_state.plan_key != plan_key:
             st.session_state.generation_plan = plan_pdf(
                 gpx_data, map_type, scale_factor, overlap, page_margin, draw_magnetic_north,
-                magnetic_spacing_m=magnetic_spacing_m, document=document,
+                magnetic_spacing_m=magnetic_spacing_m, document=document, limits=DEFAULT_LIMITS,
             )
             st.session_state.plan_key = plan_key
         plan = st.session_state.generation_plan
@@ -172,7 +190,8 @@ with st.container(border=True):
             st.write(f'処理用メモリの見込み：{plan.estimated_memory_bytes / 1024**2:,.0f}MiB '
                      f'（設定上限 {DEFAULT_LIMITS.memory_bytes / 1024**2:,.0f}MiB）')
             st.caption('実行環境全体の使用量とは異なる推算です。同じサーバーでのPDF作成は順番に処理します。')
-            st.write(f'最大{DEFAULT_LIMITS.pages}ページ / {DEFAULT_LIMITS.tiles}タイル / PDF 64MiB')
+            st.write(f'最大{DEFAULT_LIMITS.pages}ページ / {DEFAULT_LIMITS.tiles}タイル / PDF 1ファイルあたり{DEFAULT_LIMITS.pdf_bytes / 1024**2:g}MiB')
+            st.caption('PDF容量の上限を超える場合は、ページ単位で自動分割し、ZIPでまとめて保存できます。')
             st.caption('縮尺は対象範囲の中央緯度を基準にします。範囲内の投影による変動が1%を超える場合は作成しません。')
     else:
         st.caption('有効なGPXを選ぶと、ページ数と地図の配置を確認できます。')
@@ -204,24 +223,27 @@ with st.container(border=True):
                 }
                 status.info(messages[progress.stage])
             try:
-                pdf_bytes = generate_pdf(
+                name = os.path.splitext(os.path.basename(uploaded_file.name))[0]
+                with generate_output(
                     gpx_data, map_type, scale_factor, overlap, page_margin, draw_magnetic_north,
                     magnetic_spacing_m=magnetic_spacing_m,
-                    progress_callback=on_progress, plan=plan,
-                )
-                st.session_state.pdf_bytes = pdf_bytes
-                name = os.path.splitext(os.path.basename(uploaded_file.name))[0]
-                st.session_state.pdf_filename = f'{name}_map.pdf'
+                    progress_callback=on_progress, plan=plan, limits=plan.limits,
+                ) as output:
+                    st.session_state.pdf_filename = f'{name}_map{".zip" if output.is_zip else ".pdf"}'
+                    st.session_state.download_artifact = DownloadArtifact(output, st.session_state.pdf_filename)
                 st.session_state.pdf_summary = f'{plan.page_count}ページ / {MAP_LABELS[map_type]} / 1:{scale_denominator:,} / A4横 / 余白{page_margin:g}mm'
             except Exception as error:
-                st.session_state.pdf_bytes = None
+                clear_result()
+                st.session_state.error_details = str(error)
                 if isinstance(error, MagneticNorthError):
                     st.session_state.error_message = '磁気偏角を計算できなかったため、PDFの生成に失敗しました。エラーの詳細を確認してください。'
                 elif isinstance(error, TileDownloadError):
                     st.session_state.error_message = '地図を取得できなかったため、PDFは作成していません。通信状況とエラーの詳細を確認して再試行してください。'
+                elif isinstance(error, GPX2MapError):
+                    st.session_state.error_message = str(error)
+                    st.session_state.error_details = None
                 else:
                     st.session_state.error_message = 'PDFを作成できませんでした。ファイルや設定、エラーの詳細を確認して再試行してください。'
-                st.session_state.error_details = str(error)
             finally:
                 st.session_state.generating = False
                 st.session_state.run_generation = False
@@ -231,12 +253,8 @@ with st.container(border=True):
         if st.session_state.error_details:
             with st.expander('エラーの詳細'):
                 st.code(st.session_state.error_details, language=None)
-    if st.session_state.pdf_bytes is not None:
-        st.success('必要な地図タイルを確認し、PDFを作成しました。下のボタンから保存してください。')
-        st.write(st.session_state.pdf_summary)
-        st.download_button('PDFをダウンロード', data=st.session_state.pdf_bytes,
-                           file_name=st.session_state.pdf_filename, mime='application/pdf', width='stretch')
-        st.caption('印刷するときは「A4・横向き・倍率100%」を指定してください。')
+    if st.session_state.download_artifact is not None:
+        show_result(st.session_state.download_artifact)
 
 st.divider()
 st.markdown('[詳しい使い方・ソースコード](https://github.com/yuimaisa/GPX2MAP)')

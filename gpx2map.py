@@ -2,19 +2,17 @@
 import argparse
 from dataclasses import dataclass
 import hashlib
-import io
 import math
 import os
 from pathlib import Path
 import re
+import shutil
 import sys
 import tempfile
 import threading
 
 import requests
 from PIL import Image, ImageDraw, ImageFont
-from reportlab.pdfgen import canvas
-from reportlab.lib.units import mm
 
 from map_plan import (
     DEFAULT_LIMITS, GPX2MapError, ResourceLimitError, Settings,
@@ -23,6 +21,7 @@ from map_plan import (
     plan_pdf, tile_bounds, tile_to_latlon,
 )
 from tile_store import MAP_URLS, TileDownloadError, download_tile
+from pdf_output import PDFOutput, PDFPacker
 from magnetic_north import MagneticGrid, MagneticNorthError, SPACING_OPTIONS_M, calculate_declination
 
 # One render at a time per server process; sessions keep their own immutable plan.
@@ -309,9 +308,10 @@ def build_layout_preview(plan, size=(720, 420)):
     return image
 
 
-def generate_pdf(gpx_data: bytes, map_type='std', scale_factor=1.0, overlap=0.5,
-                 page_margin_mm=5.0, draw_magnetic_north=True, *, magnetic_spacing_m=1000, cache_dir=None,
-                 progress_callback=None, plan=None, limits=DEFAULT_LIMITS):
+def generate_output(gpx_data: bytes, map_type='std', scale_factor=1.0, overlap=0.5,
+                    page_margin_mm=5.0, draw_magnetic_north=True, *, magnetic_spacing_m=1000, cache_dir=None,
+                    progress_callback=None, plan=None, limits=DEFAULT_LIMITS):
+    """Return an owned disk-backed PDF or ZIP; callers must close the result."""
     settings = Settings(map_type, scale_factor, overlap, page_margin_mm, draw_magnetic_north, magnetic_spacing_m)
     if plan is None:
         plan = plan_pdf(gpx_data, map_type, scale_factor, overlap, page_margin_mm, draw_magnetic_north,
@@ -333,49 +333,57 @@ def generate_pdf(gpx_data: bytes, map_type='std', scale_factor=1.0, overlap=0.5,
         if progress_callback is not None:
             progress_callback(Progress(stage, page, plan.page_count, len(prepared), plan.tile_count))
     report('waiting', 0)
-    with _RENDER_SLOT, tempfile.TemporaryDirectory(prefix='gpx2map-pdf-') as temporary, requests.Session() as session:
-        pdf_path = Path(temporary) / 'map.pdf'
-        writer = canvas.Canvas(str(pdf_path), pagesize=(297 * mm, 210 * mm), pageCompression=1, invariant=1)
-        writer.setTitle('GPX2MAP')
-        writer.setAuthor('GPX2MAP')
-        encoded_bytes = 0
-        for index, (gx, gy) in enumerate(plan.grids, 1):
-            report('tiles', index)
-            def tile_ready(x, y):
-                if (x, y) not in prepared:
-                    prepared.add((x, y))
-                    report('tiles', index)
-            with build_map_image(gx, gy, plan.page_w_tiles, plan.page_h_tiles, map_type, session,
-                                 target_size=printable_size, cache_dir=cache_dir, tile_callback=tile_ready) as printable:
-                if magnetic_grid is not None:
-                    draw_magnetic_lines(printable, magnetic_grid, gx, gy, plan.page_w_tiles, plan.page_h_tiles)
-                draw_track_and_credits(printable, plan.document.segments, gx, gy, plan.page_w_tiles, plan.page_h_tiles,
-                                       scale_factor, page_margin_mm, magnetic_info)
-                # RGB pages are encoded and closed immediately; no list of raster pages.
-                with Image.new('RGB', (TARGET_WIDTH, TARGET_HEIGHT), 'white') as page:
-                    page.paste(printable, (margin_px, margin_px), mask=printable.getchannel('A'))
-                    page_path = Path(temporary) / f'page-{index}.jpg'
-                    page.save(page_path, format='JPEG', quality=95, subsampling=0)
-            encoded_bytes += page_path.stat().st_size
-            if encoded_bytes * 1.3 + index * 4096 > limits.pdf_bytes:
-                raise ResourceLimitError('PDFの容量が上限を超えます。対象区間を分けてください。')
-            writer.drawImage(str(page_path), 0, 0, width=297 * mm, height=210 * mm)
-            writer.showPage()
-            page_path.unlink()
-            report('page', index)
-        report('pdf', plan.page_count)
-        writer.save()
-        if pdf_path.stat().st_size > limits.pdf_bytes:
-            raise ResourceLimitError('PDFの容量が上限を超えました。対象区間を分けてください。')
-        result = pdf_path.read_bytes()
-    report('complete', plan.page_count)
-    return result
+    output = PDFOutput()
+    packer = PDFPacker(output, limits.pdf_bytes)
+    try:
+        with _RENDER_SLOT, tempfile.TemporaryDirectory(prefix='gpx2map-pdf-') as temporary, requests.Session() as session:
+            page_path = Path(temporary) / 'page.jpg'
+            for index, (gx, gy) in enumerate(plan.grids, 1):
+                report('tiles', index)
+                def tile_ready(x, y):
+                    if (x, y) not in prepared:
+                        prepared.add((x, y))
+                        report('tiles', index)
+                with build_map_image(gx, gy, plan.page_w_tiles, plan.page_h_tiles, map_type, session,
+                                     target_size=printable_size, cache_dir=cache_dir, tile_callback=tile_ready) as printable:
+                    if magnetic_grid is not None:
+                        draw_magnetic_lines(printable, magnetic_grid, gx, gy, plan.page_w_tiles, plan.page_h_tiles)
+                    draw_track_and_credits(printable, plan.document.segments, gx, gy, plan.page_w_tiles, plan.page_h_tiles,
+                                           scale_factor, page_margin_mm, magnetic_info)
+                    with Image.new('RGB', (TARGET_WIDTH, TARGET_HEIGHT), 'white') as page:
+                        with printable.getchannel('A') as alpha:
+                            page.paste(printable, (margin_px, margin_px), mask=alpha)
+                        page.save(page_path, format='JPEG', quality=95, subsampling=0)
+                # Copy the JPEG to disk-backed PDF streams after closing all raster buffers.
+                packer.add(page_path)
+                page_path.unlink()
+                report('page', index)
+            report('pdf', plan.page_count)
+            packer.finish()
+        report('complete', plan.page_count)
+        return output
+    except BaseException:
+        try:
+            packer.close()
+        finally:
+            output.close()
+        raise
+
+
+def generate_pdf(*args, **kwargs):
+    """Compatibility bytes API. The UI/CLI use generate_output to bound memory.
+
+    A split result is a ZIP. Call generate_output for large downloads rather
+    than requesting the entire result as a Python bytes object.
+    """
+    with generate_output(*args, **kwargs) as output:
+        return output.path.read_bytes()
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description='GPXから国土地理院地図のA4横PDFを作成します。')
     parser.add_argument('-i', '--input', required=True, help='入力GPXファイル')
-    parser.add_argument('-o', '--output', default='output.pdf', help='出力PDFファイル')
+    parser.add_argument('-o', '--output', default='output.pdf', help='出力PDFファイル（自動分割時は同名の.zip）')
     parser.add_argument('-s', '--scale', type=float, default=1.0, help='縮尺パラメータ（0.1〜2.0、1.0で1:25,000）')
     parser.add_argument('-m', '--margin', type=float, default=0.5, help='ページ間の重なり（0〜1タイル）')
     parser.add_argument('-t', '--type', choices=['std', 'pale', 'seamlessphoto'], default='std')
@@ -393,20 +401,23 @@ def main(argv=None):
             raise ResourceLimitError('GPXの容量は5MiB以下にしてください。')
         with path.open('rb') as source:
             data = source.read(DEFAULT_LIMITS.input_bytes + 1)
-        result = generate_pdf(data, args.type, args.scale, args.margin, args.page_margin,
-                              args.draw_magnetic_north, magnetic_spacing_m=args.magnetic_spacing, cache_dir=args.cache_dir)
-        output = Path(args.output)
-        temporary_path = None
-        try:
-            with tempfile.NamedTemporaryFile(dir=output.parent, delete=False) as handle:
-                temporary_path = Path(handle.name)
-                handle.write(result)
-            os.replace(temporary_path, output)
+        with generate_output(data, args.type, args.scale, args.margin, args.page_margin,
+                             args.draw_magnetic_north, magnetic_spacing_m=args.magnetic_spacing, cache_dir=args.cache_dir) as result:
+            output = Path(args.output)
+            if result.is_zip:
+                output = output.with_suffix('.zip')
             temporary_path = None
-        finally:
-            if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
-        print(f'PDFを作成しました: {output}')
+            try:
+                with tempfile.NamedTemporaryFile(dir=output.parent, delete=False) as handle:
+                    temporary_path = Path(handle.name)
+                    with result.path.open('rb') as source:
+                        shutil.copyfileobj(source, handle, length=64 * 1024)
+                os.replace(temporary_path, output)
+                temporary_path = None
+            finally:
+                if temporary_path is not None:
+                    temporary_path.unlink(missing_ok=True)
+            print(f'{"ZIP" if result.is_zip else "PDF"}を作成しました: {output}')
         return 0
     except (GPX2MapError, MagneticNorthError, OSError, requests.RequestException) as error:
         print(f'エラー: PDF生成に失敗しました: {error}', file=sys.stderr)
