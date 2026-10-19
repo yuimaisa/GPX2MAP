@@ -12,6 +12,7 @@ from unittest.mock import patch
 from PIL import Image, ImageDraw
 from pypdf import PdfReader
 import gpx2map
+from magnetic_north import MagneticGrid
 from map_plan import DEFAULT_LIMITS, GPX2MapError, ResourceLimitError, latlon_to_tile, plan_pdf
 from tile_store import TileDownloadError
 
@@ -66,8 +67,8 @@ class RenderingTests(unittest.TestCase):
         image = PdfReader(io.BytesIO(result)).pages[0].images[0].image
         for x in range(image.width // 2 - 10, image.width // 2 + 11):
             r, g, b = image.getpixel((x, image.height // 2))
-            self.assertLess(abs(r - g), 10)
-            self.assertGreater(b, 240)
+            # Magnetic lines may cross the gap; a red GPX bridge must not.
+            self.assertFalse(r > 150 and r > g * 1.8 and r > b * 1.8)
 
     def test_missing_tile_produces_no_pdf_and_no_complete_event(self):
         events = []
@@ -109,16 +110,16 @@ class RenderingTests(unittest.TestCase):
         for angle in (-7.5, 7.5):
             lines = []
             def capture(draw, xy, *args, **kwargs):
-                if kwargs.get('fill') == (255, 50, 50, 150):
+                if kwargs.get('fill') == (65, 100, 145, 80):
                     lines.append(xy)
                 return original(draw, xy, *args, **kwargs)
             with Image.new('RGBA', (1000, 700), 'white') as image, patch.object(ImageDraw.ImageDraw, 'line', capture):
-                gpx2map.draw_track_and_credits(image, [], 0, 0, 1, 1, declination=angle)
+                gpx2map.draw_magnetic_lines(image, MagneticGrid(angle, 0.5, 0.5, 35), 0, 0, 1, 1)
             self.assertTrue(lines)
-            for north, south in lines:
+            for segment in lines:
+                north, south = sorted(segment, key=lambda point: point[1])
                 self.assertLess(north[1], south[1])
                 self.assertEqual(north[0] > south[0], angle > 0)
-        self.assertIsNone(gpx2map.fetch_magnetic_declination(35, 139, 2026))
 
     def test_two_sessions_keep_settings_and_cache_paths_separate(self):
         data = (FIXTURES / 'sample.gpx').read_bytes()

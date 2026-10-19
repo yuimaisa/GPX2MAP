@@ -6,6 +6,7 @@ import math
 from pathlib import Path
 import sys
 import tempfile
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -14,6 +15,7 @@ import requests
 from gpx2map import generate_pdf
 from map_plan import latlon_to_tile
 from tile_store import download_tile
+from magnetic_north import calculate_declination
 
 
 class CountingSession(requests.Session):
@@ -54,10 +56,11 @@ def main():
             output.write_bytes(result)
             results['pdf'] = {'pages': 1, 'bytes': len(result), 'actual_tiles': True}
         if args.check_magnetic:
-            response = session.get('https://vldb.gsi.go.jp/sokuchi/geomag/math/cgimath/sigmath_m.cgi',
-                                   params={'use_of_data': 'xml', 'year': 2026, 'month': 1, 'day': 1,
-                                           'lat': 35.6812, 'lon': 139.7671, 'alt': 0}, timeout=(5, 15))
-            results['magnetic'] = {'legacy_endpoint_http_status': response.status_code, 'enabled': False}
+            with patch(
+                    'requests.sessions.Session.request', side_effect=AssertionError('Magnetic calculation must be offline')):
+                value = calculate_declination(35.6812, 139.7671)
+            results['magnetic'] = {'model': value.model, 'declination': value.degrees,
+                                   'date': value.calculation_date.isoformat(), 'offline': True, 'enabled': True}
     print(json.dumps(results, ensure_ascii=False))
 
 

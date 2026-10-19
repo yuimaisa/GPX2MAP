@@ -122,9 +122,14 @@ class PlanningTests(unittest.TestCase):
         with self.assertRaises(ResourceLimitError):
             plan_pdf(data, scale_factor=0.3, limits=replace(DEFAULT_LIMITS, tiles=10000, pages=100))
 
-    def test_unverified_magnetic_north_is_rejected(self):
+    def test_magnetic_north_settings_are_in_plan(self):
+        data = (FIXTURES / 'sample.gpx').read_bytes()
+        plan = plan_pdf(data, magnetic_spacing_m=500)
+        self.assertTrue(plan.settings.draw_magnetic_north)
+        self.assertEqual(plan.settings.magnetic_spacing_m, 500)
+        self.assertFalse(plan_pdf(data, draw_magnetic_north=False).settings.draw_magnetic_north)
         with self.assertRaisesRegex(GPX2MapError, '磁北線'):
-            plan_pdf((FIXTURES / 'sample.gpx').read_bytes(), draw_magnetic_north=True)
+            plan_pdf(data, magnetic_spacing_m=800)
 
     def test_wrong_document_is_rejected(self):
         data = (FIXTURES / 'sample.gpx').read_bytes()

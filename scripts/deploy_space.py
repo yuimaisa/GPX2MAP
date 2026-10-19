@@ -12,6 +12,7 @@ DEPLOY_FILES = (
     'app.py',
     'gpx2map.py',
     'map_plan.py',
+    'magnetic_north.py',
     'tile_store.py',
     'requirements.txt',
     'README.md',
