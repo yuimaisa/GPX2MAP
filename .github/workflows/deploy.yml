@@ -42,19 +42,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Push tested source to Hugging Face
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Hugging Face deployment SDK
+        run: python -m pip install -r requirements-deploy.txt
+      - name: Upload tested source to Hugging Face Spaces
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: |
-          set -eu
-          deploy_dir=$(mktemp -d)
-          cp app.py gpx2map.py map_plan.py tile_store.py requirements.txt README.md LICENSE "$deploy_dir/"
-          cp -R assets "$deploy_dir/"
-          cp -R .streamlit "$deploy_dir/"
-          cd "$deploy_dir"
-          git init -b main
-          git config user.email "action@github.com"
-          git config user.name "GitHub Action"
-          git add app.py gpx2map.py map_plan.py tile_store.py requirements.txt README.md LICENSE assets .streamlit/config.toml
-          git commit -m "Deploy tested GPX2MAP source"
-          git push --force "https://yuishin:$HF_TOKEN@huggingface.co/spaces/yuishin/gpx2map" main
+          HF_HUB_DISABLE_PROGRESS_BARS: '1'
+        run: python scripts/deploy_space.py

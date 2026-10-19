@@ -1,0 +1,2 @@
+# Deployment tooling only; not an application dependency or Space upload.
+huggingface_hub==2.2.0
