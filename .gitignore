@@ -5,3 +5,7 @@
 __pycache__/
 tile_cache/
 fonts/
+!tests/fixtures/*.gpx
+.venv/
+.pytest_cache/
+test-results/

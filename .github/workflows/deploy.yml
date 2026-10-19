@@ -1,34 +1,60 @@
-name: Sync to Hugging Face Spaces
+name: Test and deploy
 on:
+  pull_request:
   push:
-    branches: [ main ]
+    branches: [main]
+permissions:
+  contents: read
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m unittest discover -v
+      - run: python scripts/check_memory.py
+  browser:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m playwright install --with-deps chromium
+      - run: python scripts/check_browser.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: browser-checks
+          path: test-results/
   deploy:
+    needs: [test, browser]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-        with:
-          fetch-depth: 0
-          lfs: true
-      - name: Push to HF
+      - uses: actions/checkout@v4
+      - name: Push tested source to Hugging Face
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          git config --global user.email "action@github.com"
-          git config --global user.name "GitHub Action"
-          
-          # デプロイ用の一時フォルダを作成し、必要なソースファイルだけをコピー
-          mkdir -p /tmp/hf_deploy
-          cp app.py /tmp/hf_deploy/
-          cp gpx2map.py /tmp/hf_deploy/
-          cp requirements.txt /tmp/hf_deploy/
-          cp README.md /tmp/hf_deploy/
-          
-          # 新規にGitリポジトリを初期化してコミット
-          cd /tmp/hf_deploy
+          set -eu
+          deploy_dir=$(mktemp -d)
+          cp app.py gpx2map.py map_plan.py tile_store.py requirements.txt README.md LICENSE "$deploy_dir/"
+          cp -R assets "$deploy_dir/"
+          cp -R .streamlit "$deploy_dir/"
+          cd "$deploy_dir"
           git init -b main
-          git add .
-          git commit -m "Deploy clean source files from GitHub Actions"
-          
-          # 強制プッシュ
-          git push --force https://yuishin:$HF_TOKEN@huggingface.co/spaces/yuishin/gpx2map main
+          git config user.email "action@github.com"
+          git config user.name "GitHub Action"
+          git add app.py gpx2map.py map_plan.py tile_store.py requirements.txt README.md LICENSE assets .streamlit/config.toml
+          git commit -m "Deploy tested GPX2MAP source"
+          git push --force "https://yuishin:$HF_TOKEN@huggingface.co/spaces/yuishin/gpx2map" main

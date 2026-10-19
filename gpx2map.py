@@ -1,401 +1,91 @@
+"""GPX to A4 landscape PDF, with bounded page-at-a-time rendering."""
+import argparse
+from dataclasses import dataclass
+import hashlib
+import io
 import math
 import os
-import time
-import io
-import argparse
+from pathlib import Path
+import re
+import sys
+import tempfile
+import threading
+
 import requests
-import gpxpy
 from PIL import Image, ImageDraw, ImageFont
-import datetime
-import xml.etree.ElementTree as ET
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import mm
 
-# 地理院タイルのURL定義
-MAP_URLS = {
-    "std": "https://cyberjapandata.gsi.go.jp/xyz/std/15/{x}/{y}.png",
-    "pale": "https://cyberjapandata.gsi.go.jp/xyz/pale/15/{x}/{y}.png",
-    "seamlessphoto": "https://cyberjapandata.gsi.go.jp/xyz/seamlessphoto/15/{x}/{y}.jpg"
-}
+from map_plan import (
+    DEFAULT_LIMITS, GPX2MapError, ResourceLimitError, Settings,
+    TARGET_WIDTH, TARGET_HEIGHT, ZOOM_LEVEL, calculate_grids, inspect_gpx,
+    is_point_in_box, is_segment_intersecting_grid, latlon_to_tile, parse_gpx,
+    plan_pdf, tile_bounds, tile_to_latlon,
+)
+from tile_store import MAP_URLS, TileDownloadError, download_tile
 
-# A4横サイズ（300 DPI基準）
-TARGET_WIDTH = 3508
-TARGET_HEIGHT = 2480
-ASPECT_RATIO = TARGET_WIDTH / TARGET_HEIGHT # 約1.4145
+# One render at a time per server process; sessions keep their own immutable plan.
+_RENDER_SLOT = threading.BoundedSemaphore(1)
 
-ZOOM_LEVEL = 15 # 等高線10mが描画される解像度固定
+
+@dataclass(frozen=True)
+class Progress:
+    stage: str
+    page: int
+    pages: int
+    tiles: int
+    total_tiles: int
+
+
+def parse_declination(value):
+    """Parse signed decimal or degree/minute notation; east is positive."""
+    text = str(value).strip().replace('−', '-')
+    if '°' not in text:
+        result = float(text)
+    else:
+        match = re.fullmatch(r'([+-]?\d+(?:\.\d+)?)\s*°\s*(\d+(?:\.\d+)?)\s*[\'′]?', text)
+        if not match or float(match[2]) >= 60:
+            raise GPX2MapError('偏角の度分表記が不正です。')
+        result = (abs(float(match[1])) + float(match[2]) / 60) * (-1 if match[1].startswith('-') else 1)
+    if not math.isfinite(result) or abs(result) > 180:
+        raise GPX2MapError('偏角の値が不正です。')
+    return result
+
 
 def fetch_magnetic_declination(lat, lon, year):
-    """
-    国土地理院の地磁気値計算API等から磁気偏角を取得する。
-    """
-    url = "https://vldb.gsi.go.jp/sokuchi/geomag/math/cgimath/sigmath_m.cgi"
-    params = {
-        "use_of_data": "xml",
-        "year": year,
-        "month": 1,
-        "day": 1,
-        "lat": lat,
-        "lon": lon,
-        "alt": 0
-    }
-    try:
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
-        
-        # XML解析
-        root = ET.fromstring(response.content)
-        dec_str = root.findtext(".//declination")
-        if dec_str:
-            if "°" in dec_str:
-                parts = dec_str.split("°")
-                deg = float(parts[0])
-                min_str = parts[1].replace("'", "").replace("′", "")
-                return deg + float(min_str) / 60.0
-            return float(dec_str)
-    except Exception as e:
-        print(f"警告: 磁気偏角の取得に失敗しました。プログラムは続行します。({e})")
-    
+    """The legacy GSI endpoint returns 404; no unverified replacement is used."""
     return None
 
-def latlon_to_tile(lat, lon, zoom=ZOOM_LEVEL):
-    """
-    緯度経度をタイル座標(x, y)の浮動小数点数に変換する。
-    """
-    lat_rad = math.radians(lat)
-    n = 2.0 ** zoom
-    x = (lon + 180.0) / 360.0 * n
-    # 緯度のメルカトル投影によるタイルY座標計算
-    # 緯度が極端に高い・低い場合のゼロ除算を防ぐためにクリップ
-    lat_rad = max(min(lat_rad, 1.48), -1.48)
-    y = (1.0 - math.log(math.tan(lat_rad) + (1.0 / math.cos(lat_rad))) / math.pi) / 2.0 * n
-    return x, y
 
-def tile_to_latlon(x, y, zoom=ZOOM_LEVEL):
-    """
-    タイル座標(x, y)を緯度経度に変換する。
-    """
-    n = 2.0 ** zoom
-    lon_deg = x / n * 360.0 - 180.0
-    lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * y / n)))
-    lat_deg = math.degrees(lat_rad)
-    return lat_deg, lon_deg
+def build_map_image(grid_x, grid_y, page_w_tiles, page_h_tiles, map_type, session=None,
+                    *, target_size=(TARGET_WIDTH, TARGET_HEIGHT), cache_dir=None, tile_callback=None):
+    """Composite tiles directly into print resolution, without a tile-size mosaic."""
+    width, height = target_size
+    image = Image.new('RGBA', target_size, 'white')
+    x0, x1, y0, y1 = tile_bounds(grid_x, grid_y, page_w_tiles, page_h_tiles)
+    try:
+        for y in range(y0, y1):
+            for x in range(x0, x1):
+                tile = download_tile(x, y, ZOOM_LEVEL, map_type, session=session, cache_dir=cache_dir)
+                try:
+                    left = round((x - grid_x) / page_w_tiles * width)
+                    right = round((x + 1 - grid_x) / page_w_tiles * width)
+                    top = round((y - grid_y) / page_h_tiles * height)
+                    bottom = round((y + 1 - grid_y) / page_h_tiles * height)
+                    resized = tile.resize((max(1, right - left), max(1, bottom - top)), Image.Resampling.LANCZOS)
+                    try:
+                        image.paste(resized, (left, top))
+                    finally:
+                        resized.close()
+                finally:
+                    tile.close()
+                if tile_callback is not None:
+                    tile_callback(x, y)
+        return image
+    except BaseException:
+        image.close()
+        raise
 
-def parse_gpx(gpx_data: bytes):
-    """
-    GPXデータのバイト列を解析し、トラックポイントの緯度経度リストのリスト（セグメントごと）を返す。
-    """
-    gpx = gpxpy.parse(gpx_data)
-    tracks_points = []
-    
-    for track in gpx.tracks:
-        for segment in track.segments:
-            points = []
-            for point in segment.points:
-                points.append((point.latitude, point.longitude))
-            if points:
-                tracks_points.append(points)
-                
-    # トラックがないがルートやウェイポイントがある場合への簡単なフォールバック
-    if not tracks_points:
-        points = []
-        for route in gpx.routes:
-            for point in route.points:
-                points.append((point.latitude, point.longitude))
-        if points:
-            tracks_points.append(points)
-            
-    if not tracks_points:
-        points = []
-        for wp in gpx.waypoints:
-            points.append((wp.latitude, wp.longitude))
-        if points:
-            tracks_points.append(points)
-            
-    return tracks_points
-
-def is_point_in_box(x, y, bx, by, bw, bh):
-    """点が矩形内にあるか判定"""
-    return bx <= x <= bx + bw and by <= y <= by + bh
-
-def is_segment_intersecting_grid(p1, p2, gx, gy, gw, gh):
-    """
-    線分p1-p2がグリッド(gx, gy, gw, gh)と交差するか判定する。
-    """
-    x1, y1 = p1
-    x2, y2 = p2
-    
-    # どちらかの端点がグリッド内にある場合は交差
-    if is_point_in_box(x1, y1, gx, gy, gw, gh) or is_point_in_box(x2, y2, gx, gy, gw, gh):
-        return True
-        
-    # 線分のAABB（Bounding Box）とグリッドのAABBが重ならない場合は交差しない
-    seg_min_x, seg_max_x = min(x1, x2), max(x1, x2)
-    seg_min_y, seg_max_y = min(y1, y2), max(y1, y2)
-    
-    if seg_max_x < gx or seg_min_x > gx + gw or seg_max_y < gy or seg_min_y > gy + gh:
-        return False
-        
-    # 各辺との交差判定
-    # 左辺 x = gx
-    if x1 != x2:
-        y_left = y1 + (y2 - y1) * (gx - x1) / (x2 - x1)
-        if min(x1, x2) <= gx <= max(x1, x2) and gy <= y_left <= gy + gh:
-            return True
-            
-        # 右辺 x = gx + gw
-        y_right = y1 + (y2 - y1) * (gx + gw - x1) / (x2 - x1)
-        if min(x1, x2) <= gx + gw <= max(x1, x2) and gy <= y_right <= gy + gh:
-            return True
-            
-    if y1 != y2:
-        # 上辺 y = gy
-        x_top = x1 + (x2 - x1) * (gy - y1) / (y2 - y1)
-        if min(y1, y2) <= gy <= max(y1, y2) and gx <= x_top <= gx + gw:
-            return True
-            
-        # 下辺 y = gy + gh
-        x_bottom = x1 + (x2 - x1) * (gy + gh - y1) / (y2 - y1)
-        if min(y1, y2) <= gy + gh <= max(y1, y2) and gx <= x_bottom <= gx + gw:
-            return True
-            
-    return False
-
-def calculate_grids(tracks_points, scale_factor=1.0, overlap=0.5, page_margin_mm=5.0):
-    """
-    GPXトラックポイント全体を網羅するA4横比率のグリッドを生成し、
-    トラックが通過するグリッドセルのリストを返す。
-    S=1.0のときに1:25,000縮尺となるように、緯度から動的にタイル数を決定します。
-    """
-    # 1. すべてのトラックポイントから平均緯度を算出
-    all_lats = []
-    for segment in tracks_points:
-        for lat, lon in segment:
-            all_lats.append(lat)
-            
-    if all_lats:
-        avg_lat = sum(all_lats) / len(all_lats)
-    else:
-        avg_lat = 35.0
-        
-    avg_lat = max(min(avg_lat, 85.0), -85.0)
-    
-    # 2. 平均緯度における1タイルの地上距離 (メートル) を算出
-    # 地球赤道半径 R = 6378137.0m, ズームレベル15
-    R = 6378137.0
-    lat_rad = math.radians(avg_lat)
-    tile_ground_meter = (2.0 * math.pi * R * math.cos(lat_rad)) / (2.0 ** ZOOM_LEVEL)
-    
-    # 3. A4サイズ（横297mm × 縦210mm）から余白を除いた印刷可能領域でS=1.0時に1:25,000縮尺となるページ幅・高さを決定
-    printable_width_mm = 297.0 - 2 * page_margin_mm
-    printable_height_mm = 210.0 - 2 * page_margin_mm
-    
-    scale_denom = 25000.0 / scale_factor
-    target_width_m = (printable_width_mm / 1000.0) * scale_denom
-    target_height_m = (printable_height_mm / 1000.0) * scale_denom
-    
-    # floatのページ幅・高さタイル数
-    page_w_tiles = target_width_m / tile_ground_meter
-    page_h_tiles = target_height_m / tile_ground_meter
-    
-    # すべてのトラックポイントのタイル座標を計算
-    all_tile_coords = []
-    for segment in tracks_points:
-        segment_coords = []
-        for lat, lon in segment:
-            tx, ty = latlon_to_tile(lat, lon, ZOOM_LEVEL)
-            segment_coords.append((tx, ty))
-        all_tile_coords.append(segment_coords)
-        
-    if not all_tile_coords or not any(all_tile_coords):
-        return [], page_w_tiles, page_h_tiles
-        
-    # 全体の範囲を求める
-    flat_coords = [pt for seq in all_tile_coords for pt in seq]
-    xs = [pt[0] for pt in flat_coords]
-    ys = [pt[1] for pt in flat_coords]
-    min_x, max_x = min(xs), max(xs)
-    min_y, max_y = min(ys), max(ys)
-    
-    # 隣接するページ間の重なり（マージン）
-    step_w = max(1.0, page_w_tiles - overlap)
-    step_h = max(1.0, page_h_tiles - overlap)
-    
-    W = max_x - min_x
-    H = max_y - min_y
-    
-    # 必要なページ数を計算
-    if W <= page_w_tiles:
-        n_w = 1
-    else:
-        n_w = math.ceil((W - page_w_tiles) / step_w) + 1
-        
-    if H <= page_h_tiles:
-        n_h = 1
-    else:
-        n_h = math.ceil((H - page_h_tiles) / step_h) + 1
-        
-    # グリッド全体がカバーする合計幅と高さ
-    total_w = (n_w - 1) * step_w + page_w_tiles
-    total_h = (n_h - 1) * step_h + page_h_tiles
-    
-    # トラック全体の中心とグリッド全体の中心を一致させるように開始位置を計算
-    start_x = min_x + (W - total_w) / 2
-    start_y = min_y + (H - total_h) / 2
-    
-    grids = []
-    
-    for i in range(n_h):
-        curr_y = start_y + i * step_h
-        for j in range(n_w):
-            curr_x = start_x + j * step_w
-            
-            # このグリッド領域にトラックが交差するか判定
-            intersects = False
-            for segment in all_tile_coords:
-                if len(segment) == 1:
-                    if is_point_in_box(segment[0][0], segment[0][1], curr_x, curr_y, page_w_tiles, page_h_tiles):
-                        intersects = True
-                        break
-                else:
-                    for k in range(len(segment) - 1):
-                        if is_segment_intersecting_grid(segment[k], segment[k+1], curr_x, curr_y, page_w_tiles, page_h_tiles):
-                            intersects = True
-                            break
-                    if intersects:
-                        break
-            
-            if intersects:
-                # このグリッドに含まれるトラックポイントを抽出
-                points_in_grid = []
-                for segment in all_tile_coords:
-                    for tx, ty in segment:
-                        if curr_x <= tx <= curr_x + page_w_tiles and curr_y <= ty <= curr_y + page_h_tiles:
-                            points_in_grid.append((tx, ty))
-                            
-                if points_in_grid:
-                    xs_p = [pt[0] for pt in points_in_grid]
-                    ys_p = [pt[1] for pt in points_in_grid]
-                    min_x_p, max_x_p = min(xs_p), max(xs_p)
-                    min_y_p, max_y_p = min(ys_p), max(ys_p)
-                    
-                    w_p = max_x_p - min_x_p
-                    h_p = max_y_p - min_y_p
-                    
-                    # 含まれる範囲がページサイズ以下であれば、その中心にグリッドをシフト
-                    if w_p <= page_w_tiles and h_p <= page_h_tiles:
-                        cx = (min_x_p + max_x_p) / 2
-                        cy = (min_y_p + max_y_p) / 2
-                        grid_x = cx - page_w_tiles / 2
-                        grid_y = cy - page_h_tiles / 2
-                    else:
-                        grid_x = curr_x
-                        grid_y = curr_y
-                else:
-                    grid_x = curr_x
-                    grid_y = curr_y
-                    
-                grids.append((grid_x, grid_y))
-                
-    return grids, page_w_tiles, page_h_tiles
-
-def download_tile(x, y, z, map_type, session=None, cache_dir=None):
-    """
-    国土地理院からタイルをダウンロードする。ローカルキャッシュを優先し、
-    新規リクエスト時はセッションを使い回し、かつリトライ機構（指数バックオフ）で接続を安定化させる。
-    """
-    if cache_dir is None:
-        cache_dir = os.environ.get("GPX2MAP_CACHE_DIR", "tile_cache")
-        
-    # 座標の検証 (ズーム15のタイル範囲チェック)
-    max_tile_idx = 2**z - 1
-    if not (0 <= x <= max_tile_idx and 0 <= y <= max_tile_idx):
-        # 範囲外の場合は空の透明な画像を返す
-        return Image.new("RGBA", (256, 256), (255, 255, 255, 0))
-        
-    ext = "jpg" if map_type == "seamlessphoto" else "png"
-    tile_cache_path = os.path.join(cache_dir, map_type, str(z), str(x), f"{y}.{ext}")
-    
-    if os.path.exists(tile_cache_path):
-        try:
-            return Image.open(tile_cache_path).convert("RGBA")
-        except Exception:
-            # キャッシュ破損時は削除して再ダウンロード
-            os.remove(tile_cache_path)
-            
-    # 新規ダウンロード
-    os.makedirs(os.path.dirname(tile_cache_path), exist_ok=True)
-    
-    url = MAP_URLS.get(map_type, MAP_URLS["std"]).format(x=x, y=y)
-    
-    headers = {
-        "User-Agent": "GPX2MAP/1.0 (https://github.com/yuimaisa/GPX2MAP; Python-requests)"
-    }
-    
-    client = session if session is not None else requests.Session()
-    
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            # サーバー負荷防止のため待機（リトライ時は徐々に長くする）
-            wait_time = 0.15 * (2 ** attempt)
-            time.sleep(wait_time)
-            
-            response = client.get(url, headers=headers, timeout=10)
-            if response.status_code == 200:
-                with open(tile_cache_path, "wb") as f:
-                    f.write(response.content)
-                return Image.open(io.BytesIO(response.content)).convert("RGBA")
-            elif response.status_code == 404:
-                # 地図データが存在しない領域（海など）は白色画像で埋める
-                img = Image.new("RGBA", (256, 256), (240, 240, 240, 255))
-                # キャッシュ保存して無駄なリクエストを防ぐ
-                img.save(tile_cache_path)
-                return img
-            else:
-                print(f"警告: タイルの取得に失敗しました (HTTP {response.status_code}): {url}")
-        except (requests.RequestException, ConnectionResetError) as e:
-            if attempt < max_retries - 1:
-                # 警告ログを出して再試行
-                print(f"警告: 接続エラーが発生しました。再試行します ({attempt + 1}/{max_retries}): {e}")
-            else:
-                print(f"エラー: タイル取得中に回復不能なエラーが発生しました: {e}")
-        
-    # エラー時のフォールバック（薄いグレーのダミータイル）
-    return Image.new("RGBA", (256, 256), (230, 230, 230, 255))
-
-def build_map_image(grid_x, grid_y, page_w_tiles, page_h_tiles, map_type, session=None):
-    """
-    指定されたグリッド範囲のタイル画像を結合し、1枚の大きな画像を作成する。
-    grid_x, grid_y, page_w_tiles, page_h_tiles は浮動小数点数も許容し、
-    切り出しを行って正確なスケールを実現する。
-    """
-    # 必要な整数のタイル座標範囲を特定
-    start_tile_x = math.floor(grid_x)
-    end_tile_x = math.ceil(grid_x + page_w_tiles)
-    start_tile_y = math.floor(grid_y)
-    end_tile_y = math.ceil(grid_y + page_h_tiles)
-    
-    num_tiles_x = end_tile_x - start_tile_x
-    num_tiles_y = end_tile_y - start_tile_y
-    
-    # 結合用の大きなキャンバスを作成
-    map_img = Image.new("RGBA", (num_tiles_x * 256, num_tiles_y * 256), (255, 255, 255, 255))
-    
-    for dy in range(num_tiles_y):
-        for dx in range(num_tiles_x):
-            tx = start_tile_x + dx
-            ty = start_tile_y + dy
-            tile = download_tile(tx, ty, ZOOM_LEVEL, map_type, session=session)
-            map_img.paste(tile, (dx * 256, dy * 256))
-            
-    # float座標に基づいて、正確な切り出し位置をピクセル単位で計算
-    crop_left = round((grid_x - start_tile_x) * 256)
-    crop_top = round((grid_y - start_tile_y) * 256)
-    crop_right = round((grid_x + page_w_tiles - start_tile_x) * 256)
-    crop_bottom = round((grid_y + page_h_tiles - start_tile_y) * 256)
-    
-    # 切り出した画像は正確に page_w_tiles * 256 x page_h_tiles * 256 に近いサイズになる
-    cropped_img = map_img.crop((crop_left, crop_top, crop_right, crop_bottom))
-    return cropped_img
 
 def draw_track_and_credits(image, tracks_points, grid_x, grid_y, page_w_tiles, page_h_tiles, scale_factor=1.0, page_margin_mm=5.0, declination=None):
     """
@@ -407,8 +97,8 @@ def draw_track_and_credits(image, tracks_points, grid_x, grid_y, page_w_tiles, p
     
     # 磁北線の描画 (赤線)
     if declination is not None:
-        # 西偏を正として、上方向(真北)から反時計回りに回転
-        angle_rad = math.radians(abs(declination))
+        # 東偏を正とする。北は画面の上、東は画面の右。
+        angle_rad = math.radians(declination)
         spacing = 800  # 線の間隔(ピクセル)
         diag = math.hypot(img_w, img_h)
         cx, cy = img_w / 2, img_h / 2
@@ -416,15 +106,15 @@ def draw_track_and_credits(image, tracks_points, grid_x, grid_y, page_w_tiles, p
         for offset in range(-int(diag), int(diag), spacing):
             # 垂直線に対する法線方向にオフセットを移動
             base_x = cx + offset * math.cos(angle_rad)
-            base_y = cy - offset * math.sin(angle_rad)
+            base_y = cy + offset * math.sin(angle_rad)
             
             # 線分の方向ベクトル (上下にdiag伸ばす)
             dx = math.sin(angle_rad) * diag
             dy = math.cos(angle_rad) * diag
             
             # Y軸は下方向が正であるため、北方向は -dy、南方向は +dy
-            x1, y1 = base_x - dx, base_y - dy
-            x2, y2 = base_x + dx, base_y + dy
+            x1, y1 = base_x + dx, base_y - dy
+            x2, y2 = base_x - dx, base_y + dy
             
             draw.line([(x1, y1), (x2, y2)], fill=(255, 50, 50, 150), width=3)
     
@@ -453,6 +143,7 @@ def draw_track_and_credits(image, tracks_points, grid_x, grid_y, page_w_tiles, p
     font_medium = None
     local_font_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
     font_paths = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "NotoSansJP-Regular.otf"),
         os.path.join(local_font_dir, "NotoSansJP-Regular.otf"),
         os.path.join(local_font_dir, "NotoSansJP-Regular.ttf"),
         "C:\\Windows\\Fonts\\msgothic.ttc",
@@ -469,8 +160,7 @@ def draw_track_and_credits(image, tracks_points, grid_x, grid_y, page_w_tiles, p
                 pass
                 
     if font_large is None:
-        font_large = ImageFont.load_default()
-        font_medium = font_large
+        raise GPX2MapError('日本語フォントを読み込めません。assetsのフォントを配置し直してください。')
         
     # 右下の出典クレジットの描画
     credit_text = "地図：国土地理院"
@@ -600,141 +290,122 @@ def draw_track_and_credits(image, tracks_points, grid_x, grid_y, page_w_tiles, p
     # 右縦線
     draw.line(((bar_end_x, bar_line_y - 5), (bar_end_x, bar_line_y + 5)), fill=(50, 50, 50, 255), width=3)
 
-def generate_pdf(gpx_data: bytes, map_type: str = "std", scale_factor: float = 1.0, overlap: float = 0.5, page_margin_mm: float = 5.0, draw_magnetic_north: bool = False) -> bytes:
-    """
-    GPXデータのバイト列を受け取り、A4横マルチページPDFを生成して、そのPDFデータのバイト列を返す。
-    WebアプリおよびCLIから共通利用されるコア関数。
-    """
-    # 1. 余白（ピクセル数）と印刷可能領域の計算
-    margin_px = int(round(page_margin_mm * (300.0 / 25.4)))
-    printable_width = TARGET_WIDTH - 2 * margin_px
-    printable_height = TARGET_HEIGHT - 2 * margin_px
-    
-    # 2. GPXデータのパース
-    tracks_points = parse_gpx(gpx_data)
-    if not tracks_points or not any(tracks_points):
-        raise ValueError("有効なGPX軌跡データがありませんでした。")
-        
-    # 3. グリッドセルの計算
-    grids, page_w_tiles, page_h_tiles = calculate_grids(tracks_points, scale_factor, overlap, page_margin_mm)
-    if not grids:
-        raise ValueError("トラックを包含する地図範囲の計算に失敗しました。")
-        
-    # 磁北線フラグが有効な場合、中心座標を求めて偏角を取得
-    declination = None
-    if draw_magnetic_north:
-        all_lats = []
-        all_lons = []
-        for segment in tracks_points:
-            for lat, lon in segment:
-                all_lats.append(lat)
-                all_lons.append(lon)
-        if all_lats and all_lons:
-            center_lat = sum(all_lats) / len(all_lats)
-            center_lon = sum(all_lons) / len(all_lons)
-            current_year = datetime.datetime.now().year
-            declination = fetch_magnetic_declination(center_lat, center_lon, current_year)
-            if declination is not None:
-                print(f"情報: 磁気偏角を取得しました: {declination:.2f}度")
-        
-    # 安全装置: 合計ダウンロードタイル数のチェック
-    total_tiles = len(grids) * math.ceil(page_w_tiles) * math.ceil(page_h_tiles)
-    print(f"情報: 生成ページ数={len(grids)}, 1ページあたりのタイル数={page_w_tiles:.1f}x{page_h_tiles:.1f} (約{page_w_tiles*page_h_tiles:.1f}枚)")
-    print(f"情報: 想定ダウンロード最大タイル数 = {total_tiles} 枚")
-    
-    # 1回の処理で500タイルを超える場合はウェイト制御の警告を出しつつ、進行
-    if total_tiles > 500:
-        print("警告: タイル数が非常に多いため、ダウンロード完了までに時間がかかります。")
-        
-    pages = []
-    
-    # 4. セッションを利用して接続を使い回す
-    with requests.Session() as session:
-        for idx, (grid_x, grid_y) in enumerate(grids):
-            print(f"進捗: ページ {idx + 1} / {len(grids)} の地図画像を構築中... (タイル基準左上: {grid_x}, {grid_y})")
-            
-            # タイル画像を結合
-            map_img = build_map_image(grid_x, grid_y, page_w_tiles, page_h_tiles, map_type, session=session)
-            
-            # 印刷可能領域の解像度にリサイズ
-            # 高品質リサンプリングフィルター（LANCZOS）を使用
-            printable_img = map_img.resize((printable_width, printable_height), Image.Resampling.LANCZOS)
-            
-            # 軌跡とクレジットを描画
-            draw_track_and_credits(printable_img, tracks_points, grid_x, grid_y, page_w_tiles, page_h_tiles, scale_factor, page_margin_mm, declination)
-            
-            # PDF用にRGBモードに変換（PDF保存時はアルファチャンネル不可のため背景白で合成）
-            pdf_page = Image.new("RGB", (TARGET_WIDTH, TARGET_HEIGHT), (255, 255, 255))
-            pdf_page.paste(printable_img, (margin_px, margin_px), mask=printable_img.split()[3]) # アルファチャンネルをマスクとして使用
-            
-            pages.append(pdf_page)
-            
-            # サーバー負荷防止のため、ページ切り替え時に少し余分にスリープ（1.5秒）
-            if len(grids) > 1 and idx < len(grids) - 1:
-                print("サーバー負荷軽減のため、1.5秒待機しています...")
-                time.sleep(1.5)
-                
-    if not pages:
-        raise ValueError("PDFページの生成に失敗しました。")
-        
-    # 5. PillowのマルチページPDF書き出し機能を使用してバイトデータに変換
-    pdf_buffer = io.BytesIO()
-    pages[0].save(
-        pdf_buffer,
-        format="PDF",
-        resolution=300.0,
-        save_all=True,
-        append_images=pages[1:]
-    )
-    
-    return pdf_buffer.getvalue()
+def build_layout_preview(plan, size=(720, 420)):
+    image = Image.new('RGB', size, 'white')
+    draw = ImageDraw.Draw(image, 'RGBA')
+    min_x = min(x for x, _ in plan.grids)
+    min_y = min(y for _, y in plan.grids)
+    max_x = max(x + plan.page_w_tiles for x, _ in plan.grids)
+    max_y = max(y + plan.page_h_tiles for _, y in plan.grids)
+    factor = min((size[0] - 40) / (max_x - min_x), (size[1] - 40) / (max_y - min_y))
+    offset_x = (size[0] - (max_x - min_x) * factor) / 2
+    offset_y = (size[1] - (max_y - min_y) * factor) / 2
+    def pixel(x, y):
+        return offset_x + (x - min_x) * factor, offset_y + (y - min_y) * factor
+    for index, (x, y) in enumerate(plan.grids, 1):
+        left, top = pixel(x, y)
+        right, bottom = pixel(x + plan.page_w_tiles, y + plan.page_h_tiles)
+        draw.rectangle((left, top, right, bottom), fill=(75, 130, 190, 25), outline=(45, 100, 170, 255), width=2)
+        draw.text((left + 5, top + 5), str(index), fill=(20, 50, 90, 255))
+    for segment in plan.document.segments:
+        points = [pixel(*latlon_to_tile(*point)) for point in segment]
+        if len(points) > 1:
+            draw.line(points, fill=(220, 25, 25, 255), width=3)
+        else:
+            x, y = points[0]
+            draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=(220, 25, 25, 255))
+    return image
 
-def main():
-    parser = argparse.ArgumentParser(description="GPXデータから国土地理院地図のA4横PDFを出力します。")
-    parser.add_argument("-i", "--input", required=True, help="入力GPXファイルのパス")
-    parser.add_argument("-o", "--output", default="output.pdf", help="出力PDFファイルのパス (デフォルト: output.pdf)")
-    parser.add_argument("-s", "--scale", type=float, default=1.0, help="縮小パラメータ (0.1〜1.0, デフォルト: 1.0)")
-    parser.add_argument("-m", "--margin", type=float, default=0.5, help="隣接ページとの重複マージン（タイル数、デフォルト: 0.5）")
-    parser.add_argument("-t", "--type", choices=["std", "pale", "seamlessphoto"], default="std", 
-                        help="地図の種類: std(標準地図), pale(淡色地図), seamlessphoto(シームレス空中写真) (デフォルト: std)")
-    parser.add_argument("--page-margin", type=float, default=5.0, help="印刷用の余白 (mm, デフォルト: 5.0)")
-    parser.add_argument("--draw-magnetic-north", action="store_true", help="地図上に磁北線（赤線）を描画する")
-                        
-    args = parser.parse_args()
-    
-    if not os.path.exists(args.input):
-        print(f"エラー: 入力ファイル {args.input} が存在しません。")
-        return
-        
-    if not (0.01 <= args.scale <= 5.0):
-        print("エラー: 縮小パラメータ --scale は 0.01 以上である必要があります。")
-        return
-        
-    if args.margin < 0.0:
-        print("エラー: 重複マージン --margin は 0.0 以上である必要があります。")
-        return
-        
-    if not (0.0 <= args.page_margin < 100.0):
-        print("エラー: 印刷用の余白 --page-margin は 0.0 以上 100.0 未満である必要があります。")
-        return
-        
-    print(f"解析中: {args.input}")
+
+def generate_pdf(gpx_data: bytes, map_type='std', scale_factor=1.0, overlap=0.5,
+                 page_margin_mm=5.0, draw_magnetic_north=False, *, cache_dir=None,
+                 progress_callback=None, plan=None, limits=DEFAULT_LIMITS):
+    settings = Settings(map_type, scale_factor, overlap, page_margin_mm)
+    if plan is None:
+        plan = plan_pdf(gpx_data, map_type, scale_factor, overlap, page_margin_mm, draw_magnetic_north, limits=limits)
+    elif (draw_magnetic_north or plan.settings != settings or plan.document.digest != hashlib.sha256(gpx_data).hexdigest()
+          or plan.limits != limits):
+        raise GPX2MapError('GPXまたは設定が変更されました。生成内容を確認してやり直してください。')
+    margin_px = round(page_margin_mm * 300 / 25.4)
+    printable_size = (TARGET_WIDTH - 2 * margin_px, TARGET_HEIGHT - 2 * margin_px)
+    prepared = set()
+    def report(stage, page):
+        if progress_callback is not None:
+            progress_callback(Progress(stage, page, plan.page_count, len(prepared), plan.tile_count))
+    report('waiting', 0)
+    with _RENDER_SLOT, tempfile.TemporaryDirectory(prefix='gpx2map-pdf-') as temporary, requests.Session() as session:
+        pdf_path = Path(temporary) / 'map.pdf'
+        writer = canvas.Canvas(str(pdf_path), pagesize=(297 * mm, 210 * mm), pageCompression=1, invariant=1)
+        writer.setTitle('GPX2MAP')
+        writer.setAuthor('GPX2MAP')
+        encoded_bytes = 0
+        for index, (gx, gy) in enumerate(plan.grids, 1):
+            report('tiles', index)
+            def tile_ready(x, y):
+                if (x, y) not in prepared:
+                    prepared.add((x, y))
+                    report('tiles', index)
+            with build_map_image(gx, gy, plan.page_w_tiles, plan.page_h_tiles, map_type, session,
+                                 target_size=printable_size, cache_dir=cache_dir, tile_callback=tile_ready) as printable:
+                draw_track_and_credits(printable, plan.document.segments, gx, gy, plan.page_w_tiles, plan.page_h_tiles,
+                                       scale_factor, page_margin_mm)
+                # RGB pages are encoded and closed immediately; no list of raster pages.
+                with Image.new('RGB', (TARGET_WIDTH, TARGET_HEIGHT), 'white') as page:
+                    page.paste(printable, (margin_px, margin_px), mask=printable.getchannel('A'))
+                    page_path = Path(temporary) / f'page-{index}.jpg'
+                    page.save(page_path, format='JPEG', quality=95, subsampling=0)
+            encoded_bytes += page_path.stat().st_size
+            if encoded_bytes * 1.3 + index * 4096 > limits.pdf_bytes:
+                raise ResourceLimitError('PDFの容量が上限を超えます。対象区間を分けてください。')
+            writer.drawImage(str(page_path), 0, 0, width=297 * mm, height=210 * mm)
+            writer.showPage()
+            page_path.unlink()
+            report('page', index)
+        report('pdf', plan.page_count)
+        writer.save()
+        if pdf_path.stat().st_size > limits.pdf_bytes:
+            raise ResourceLimitError('PDFの容量が上限を超えました。対象区間を分けてください。')
+        result = pdf_path.read_bytes()
+    report('complete', plan.page_count)
+    return result
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description='GPXから国土地理院地図のA4横PDFを作成します。')
+    parser.add_argument('-i', '--input', required=True, help='入力GPXファイル')
+    parser.add_argument('-o', '--output', default='output.pdf', help='出力PDFファイル')
+    parser.add_argument('-s', '--scale', type=float, default=1.0, help='縮尺パラメータ（0.1〜2.0、1.0で1:25,000）')
+    parser.add_argument('-m', '--margin', type=float, default=0.5, help='ページ間の重なり（0〜1タイル）')
+    parser.add_argument('-t', '--type', choices=['std', 'pale', 'seamlessphoto'], default='std')
+    parser.add_argument('--page-margin', type=float, default=5.0, help='四辺の余白（0〜20mm）')
+    parser.add_argument('--draw-magnetic-north', action='store_true', help='磁北線（現在利用不可）')
+    parser.add_argument('--cache-dir', help='公開タイルのキャッシュ保存先')
+    args = parser.parse_args(argv)
     try:
-        with open(args.input, "rb") as f:
-            gpx_data = f.read()
-            
-        print("PDF生成処理を開始します。しばらくお待ちください...")
-        pdf_data = generate_pdf(gpx_data, args.type, args.scale, args.margin, args.page_margin, args.draw_magnetic_north)
-        
-        with open(args.output, "wb") as out_f:
-            out_f.write(pdf_data)
-            
-        print(f"成功: PDFファイルが生成されました -> {args.output}")
-        
-    except Exception as e:
-        print(f"エラーが発生しました: {e}")
-        import traceback
-        traceback.print_exc()
+        path = Path(args.input)
+        if path.stat().st_size > DEFAULT_LIMITS.input_bytes:
+            raise ResourceLimitError('GPXの容量は5MiB以下にしてください。')
+        with path.open('rb') as source:
+            data = source.read(DEFAULT_LIMITS.input_bytes + 1)
+        result = generate_pdf(data, args.type, args.scale, args.margin, args.page_margin,
+                              args.draw_magnetic_north, cache_dir=args.cache_dir)
+        output = Path(args.output)
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=output.parent, delete=False) as handle:
+                temporary_path = Path(handle.name)
+                handle.write(result)
+            os.replace(temporary_path, output)
+            temporary_path = None
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+        print(f'PDFを作成しました: {output}')
+        return 0
+    except (GPX2MapError, OSError, requests.RequestException) as error:
+        print(f'エラー: {error}', file=sys.stderr)
+        return 1
 
-if __name__ == "__main__":
-    main()
+
+if __name__ == '__main__':
+    sys.exit(main())
