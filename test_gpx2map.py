@@ -1,115 +1,78 @@
-import unittest
-import os
 import io
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from PIL import Image
+from pypdf import PdfReader
 from gpx2map import (
-    latlon_to_tile,
-    tile_to_latlon,
-    parse_gpx,
-    is_point_in_box,
-    is_segment_intersecting_grid,
-    calculate_grids,
-    generate_pdf
+    latlon_to_tile, tile_to_latlon, parse_gpx, is_point_in_box,
+    is_segment_intersecting_grid, calculate_grids, generate_pdf,
 )
 
+FIXTURES = Path(__file__).parent / 'tests' / 'fixtures'
+
+
 class TestGPX2Map(unittest.TestCase):
-    
-    def setUp(self):
-        self.sample_gpx_path = "sample.gpx"
-        self.sample_wide_gpx_path = "sample_wide.gpx"
-        
     def test_coordinate_conversion(self):
-        # 富士山頂付近の緯度経度
         lat, lon = 35.3606, 138.7273
-        zoom = 15
-        
-        # 緯度経度からタイル座標へ
-        tx, ty = latlon_to_tile(lat, lon, zoom)
-        self.assertGreater(tx, 0)
-        self.assertGreater(ty, 0)
-        
-        # タイル座標から緯度経度に戻す
-        lat_back, lon_back = tile_to_latlon(tx, ty, zoom)
-        
-        # ほぼ一致するか検証 (誤差がごくわずかであることを保証)
-        self.assertAlmostEqual(lat, lat_back, places=4)
-        self.assertAlmostEqual(lon, lon_back, places=4)
+        tx, ty = latlon_to_tile(lat, lon)
+        lat_back, lon_back = tile_to_latlon(tx, ty)
+        self.assertAlmostEqual(lat, lat_back, places=8)
+        self.assertAlmostEqual(lon, lon_back, places=8)
 
     def test_parse_gpx(self):
-        # sample.gpx の解析テスト
-        if os.path.exists(self.sample_gpx_path):
-            with open(self.sample_gpx_path, "rb") as f:
-                data = f.read()
-            tracks = parse_gpx(data)
-            
-            self.assertEqual(len(tracks), 1)  # 1つのトラックセグメント
-            self.assertEqual(len(tracks[0]), 4)  # 4つのポイント
-            
-            # 最初のポイントが東京タワー(35.6586, 139.7454)に近いか
-            self.assertAlmostEqual(tracks[0][0][0], 35.6586, places=4)
-            self.assertAlmostEqual(tracks[0][0][1], 139.7454, places=4)
+        tracks = parse_gpx((FIXTURES / 'sample.gpx').read_bytes())
+        self.assertEqual(len(tracks), 1)
+        self.assertEqual(len(tracks[0]), 4)
+        self.assertEqual(tracks[0][0], (35.6586, 139.7454))
 
     def test_segment_intersection(self):
-        # グリッド (10, 10, 5, 5) => x: 10~15, y: 10~15
-        gx, gy, gw, gh = 10, 10, 5, 5
-        
-        # ケース1: 完全に外側にある線分
-        p1 = (5, 5)
-        p2 = (8, 8)
-        self.assertFalse(is_segment_intersecting_grid(p1, p2, gx, gy, gw, gh))
-        
-        # ケース2: 一方の端点がグリッド内にある線分
-        p1 = (12, 12)
-        p2 = (8, 8)
-        self.assertTrue(is_segment_intersecting_grid(p1, p2, gx, gy, gw, gh))
-        
-        # ケース3: グリッドを横切る線分 (端点は両方外側)
-        p1 = (8, 12)
-        p2 = (17, 12)
-        self.assertTrue(is_segment_intersecting_grid(p1, p2, gx, gy, gw, gh))
-        
-        # ケース4: 対角線上に横切る線分
-        p1 = (8, 8)
-        p2 = (17, 17)
-        self.assertTrue(is_segment_intersecting_grid(p1, p2, gx, gy, gw, gh))
+        for p1, p2, expected in [((5, 5), (8, 8), False), ((12, 12), (8, 8), True),
+                                  ((8, 12), (17, 12), True), ((8, 8), (17, 17), True),
+                                  ((10, 5), (10, 20), True), ((5, 10), (20, 10), True)]:
+            with self.subTest(p1=p1, p2=p2):
+                self.assertEqual(is_segment_intersecting_grid(p1, p2, 10, 10, 5, 5), expected)
+        self.assertTrue(is_point_in_box(10, 10, 10, 10, 5, 5))
 
     def test_calculate_grids_single_page(self):
-        # sample.gpx (東京タワーから皇居) のグリッド計算
-        # 3km程度の短い距離なので、スケール1.0であれば1ページに収まるはず
-        if os.path.exists(self.sample_gpx_path):
-            with open(self.sample_gpx_path, "rb") as f:
-                data = f.read()
-            tracks = parse_gpx(data)
-            
-            grids, pw, ph = calculate_grids(tracks, scale_factor=1.0)
-            # グリッドの数
-            self.assertEqual(len(grids), 1)
+        tracks = parse_gpx((FIXTURES / 'sample.gpx').read_bytes())
+        self.assertEqual(len(calculate_grids(tracks)[0]), 1)
 
     def test_calculate_grids_multi_page(self):
-        # sample_wide.gpx (東京から横浜) のグリッド計算
-        # 30kmの距離なので、スケール1.0なら確実に複数ページに分割されるはず
-        if os.path.exists(self.sample_wide_gpx_path):
-            with open(self.sample_wide_gpx_path, "rb") as f:
-                data = f.read()
-            tracks = parse_gpx(data)
-            
-            grids, pw, ph = calculate_grids(tracks, scale_factor=1.0)
-            # グリッド数が2ページ以上であることを確認
-            self.assertGreater(len(grids), 1)
-            print(f"テスト情報: 東京-横浜ルートは {len(grids)} ページに分割されました。")
+        tracks = parse_gpx((FIXTURES / 'wide.gpx').read_bytes())
+        self.assertGreater(len(calculate_grids(tracks)[0]), 1)
 
     def test_generate_pdf_structure(self):
-        # sample.gpx からのPDF生成が成功し、有効なPDFヘッダ（%PDF）を持っているか
-        if os.path.exists(self.sample_gpx_path):
-            with open(self.sample_gpx_path, "rb") as f:
-                data = f.read()
-            
-            # テスト時間短縮のため、地図タイプはキャッシュが速そうな pale に
-            try:
-                pdf_data = generate_pdf(data, map_type="pale", scale_factor=1.0)
-                self.assertTrue(pdf_data.startswith(b"%PDF"))
-                self.assertGreater(len(pdf_data), 1000) # 十分なサイズがあること
-            except Exception as e:
-                self.fail(f"generate_pdf が例外をスローしました: {e}")
+        with patch('gpx2map.download_tile', side_effect=lambda *a, **kw: Image.new('RGBA', (256, 256), 'white')):
+            pdf = generate_pdf((FIXTURES / 'sample.gpx').read_bytes())
+        reader = PdfReader(io.BytesIO(pdf))
+        self.assertEqual(len(reader.pages), 1)
+        self.assertAlmostEqual(float(reader.pages[0].mediabox.width) / 72 * 25.4, 297, delta=0.1)
+        self.assertAlmostEqual(float(reader.pages[0].mediabox.height) / 72 * 25.4, 210, delta=0.1)
+        self.assertGreater(len(reader.pages[0].images), 0)
 
-if __name__ == "__main__":
+    def test_route_boundaries(self):
+        tracks = parse_gpx((FIXTURES / 'boundaries.gpx').read_bytes())
+        self.assertEqual(len(tracks), 4)
+        self.assertEqual([len(segment) for segment in tracks], [2, 2, 2, 2])
+
+    def test_waypoints_stay_independent(self):
+        self.assertEqual([len(s) for s in parse_gpx((FIXTURES / 'waypoints.gpx').read_bytes())], [1, 1])
+
+    def test_known_page_gap_is_covered(self):
+        tracks = parse_gpx((FIXTURES / 'coverage_gap.gpx').read_bytes())
+        grids, width, height = calculate_grids(tracks)
+        start, end = [latlon_to_tile(*p)[0] for p in tracks[0]]
+        y = latlon_to_tile(*tracks[0][0])[1]
+        cursor = start
+        for left, right in sorted((x, x + width) for x, top in grids if top <= y <= top + height):
+            if right < cursor:
+                continue
+            self.assertLessEqual(left, cursor + 1e-9, 'Track has an uncovered interval between pages')
+            cursor = max(cursor, right)
+        self.assertGreaterEqual(cursor, end)
+
+
+if __name__ == '__main__':
     unittest.main()

@@ -1,0 +1,7 @@
+# Runtime dependencies; resolve and freeze on Python 3.12.
+gpxpy==1.6.2
+Pillow==12.3.0
+requests==2.34.2
+streamlit==1.66.0
+reportlab==4.4.9
+defusedxml==0.7.1
