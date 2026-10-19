@@ -6,6 +6,7 @@ import math
 
 from defusedxml import ElementTree
 import gpxpy
+from magnetic_north import SPACING_OPTIONS_M, ground_meters_per_tile
 
 ZOOM_LEVEL = 15
 TARGET_WIDTH, TARGET_HEIGHT = 3508, 2480
@@ -55,6 +56,8 @@ class Settings:
     scale_factor: float = 1.0
     overlap: float = 0.5
     page_margin_mm: float = 5.0
+    draw_magnetic_north: bool = True
+    magnetic_spacing_m: int = 1000
 
 
 @dataclass(frozen=True)
@@ -92,6 +95,10 @@ def validate_settings(settings):
     _number(settings.scale_factor, '縮尺パラメータ', 0.1, 2.0)
     _number(settings.overlap, 'ページの重なり', 0.0, 1.0)
     _number(settings.page_margin_mm, '印刷用の余白（mm）', 0.0, 20.0)
+    if not isinstance(settings.draw_magnetic_north, bool):
+        raise GPX2MapError('磁北線の表示はONまたはOFFで指定してください。')
+    if settings.magnetic_spacing_m not in SPACING_OPTIONS_M:
+        raise GPX2MapError('磁北線の間隔は500m、1km、2kmから選択してください。')
 
 
 def validate_coordinate(lat, lon):
@@ -224,7 +231,7 @@ def _geometry(tracks_points, scale_factor, page_margin_mm):
     points = [point for s in segments for point in s]
     center_y = (min(p[1] for p in points) + max(p[1] for p in points)) / 2
     reference_lat = tile_to_latlon(0, center_y)[0]
-    tile_m = 2 * math.pi * 6378137.0 * math.cos(math.radians(reference_lat)) / 2**ZOOM_LEVEL
+    tile_m = ground_meters_per_tile(reference_lat, ZOOM_LEVEL)
     denominator = 25000 / scale_factor
     width = (297 - 2 * page_margin_mm) / 1000 * denominator / tile_m
     height = (210 - 2 * page_margin_mm) / 1000 * denominator / tile_m
@@ -286,11 +293,9 @@ def tile_bounds(gx, gy, width, height):
 
 
 def plan_pdf(gpx_data, map_type='std', scale_factor=1.0, overlap=0.5, page_margin_mm=5.0,
-             draw_magnetic_north=False, *, document=None, limits=DEFAULT_LIMITS):
-    settings = Settings(map_type, scale_factor, overlap, page_margin_mm)
+             draw_magnetic_north=True, *, magnetic_spacing_m=1000, document=None, limits=DEFAULT_LIMITS):
+    settings = Settings(map_type, scale_factor, overlap, page_margin_mm, draw_magnetic_north, magnetic_spacing_m)
     validate_settings(settings)
-    if draw_magnetic_north:
-        raise GPX2MapError('磁北線は取得方法と正確性の確認中です。磁北線を無効にして作成してください。')
     if document is None:
         document = inspect_gpx(gpx_data, limits)
     elif document.digest != hashlib.sha256(gpx_data).hexdigest() or document.size_bytes > limits.input_bytes or document.point_count > limits.points:

@@ -23,6 +23,7 @@ from map_plan import (
     plan_pdf, tile_bounds, tile_to_latlon,
 )
 from tile_store import MAP_URLS, TileDownloadError, download_tile
+from magnetic_north import MagneticGrid, MagneticNorthError, SPACING_OPTIONS_M, calculate_declination
 
 # One render at a time per server process; sessions keep their own immutable plan.
 _RENDER_SLOT = threading.BoundedSemaphore(1)
@@ -50,11 +51,6 @@ def parse_declination(value):
     if not math.isfinite(result) or abs(result) > 180:
         raise GPX2MapError('偏角の値が不正です。')
     return result
-
-
-def fetch_magnetic_declination(lat, lon, year):
-    """The legacy GSI endpoint returns 404; no unverified replacement is used."""
-    return None
 
 
 def build_map_image(grid_x, grid_y, page_w_tiles, page_h_tiles, map_type, session=None,
@@ -87,36 +83,22 @@ def build_map_image(grid_x, grid_y, page_w_tiles, page_h_tiles, map_type, sessio
         raise
 
 
-def draw_track_and_credits(image, tracks_points, grid_x, grid_y, page_w_tiles, page_h_tiles, scale_factor=1.0, page_margin_mm=5.0, declination=None):
+def draw_magnetic_lines(image, magnetic_grid, grid_x, grid_y, page_w_tiles, page_h_tiles):
+    """Composite faint magnetic lines inside the map, before routes and legends."""
+    with Image.new('RGBA', image.size, (0, 0, 0, 0)) as overlay:
+        draw = ImageDraw.Draw(overlay)
+        for segment in magnetic_grid.segments(grid_x, grid_y, page_w_tiles, page_h_tiles, image.size):
+            draw.line(segment, fill=(65, 100, 145, 80), width=2)
+        image.alpha_composite(overlay)
+
+
+def draw_track_and_credits(image, tracks_points, grid_x, grid_y, page_w_tiles, page_h_tiles, scale_factor=1.0, page_margin_mm=5.0, magnetic_info=None):
     """
     画像上にGPXの軌跡と国土地理院のクレジットおよび縮尺（スケールバー）を描画する。
     """
     draw = ImageDraw.Draw(image)
     img_w, img_h = image.size
     printable_width_mm = 297.0 - 2 * page_margin_mm
-    
-    # 磁北線の描画 (赤線)
-    if declination is not None:
-        # 東偏を正とする。北は画面の上、東は画面の右。
-        angle_rad = math.radians(declination)
-        spacing = 800  # 線の間隔(ピクセル)
-        diag = math.hypot(img_w, img_h)
-        cx, cy = img_w / 2, img_h / 2
-        
-        for offset in range(-int(diag), int(diag), spacing):
-            # 垂直線に対する法線方向にオフセットを移動
-            base_x = cx + offset * math.cos(angle_rad)
-            base_y = cy + offset * math.sin(angle_rad)
-            
-            # 線分の方向ベクトル (上下にdiag伸ばす)
-            dx = math.sin(angle_rad) * diag
-            dy = math.cos(angle_rad) * diag
-            
-            # Y軸は下方向が正であるため、北方向は -dy、南方向は +dy
-            x1, y1 = base_x + dx, base_y - dy
-            x2, y2 = base_x - dx, base_y + dy
-            
-            draw.line([(x1, y1), (x2, y2)], fill=(255, 50, 50, 150), width=3)
     
     # GPX軌跡の描画
     # すべてのセグメントごとに線を描く
@@ -161,6 +143,16 @@ def draw_track_and_credits(image, tracks_points, grid_x, grid_y, page_w_tiles, p
                 
     if font_large is None:
         raise GPX2MapError('日本語フォントを読み込めません。assetsのフォントを配置し直してください。')
+
+    if magnetic_info is not None:
+        lines = magnetic_info.legend_lines()
+        line_height = 42
+        text_width = max(draw.textlength(line, font=font_medium) for line in lines)
+        draw.rectangle((20, 20, 40 + text_width, 30 + line_height * len(lines)),
+                       fill=(255, 255, 255, 255), outline=(200, 200, 200, 255))
+        for index, line in enumerate(lines):
+            draw.text((30, 25 + index * line_height), line,
+                      fill=(50, 50, 50, 255), font=font_medium, anchor='lt')
         
     # 右下の出典クレジットの描画
     credit_text = "地図：国土地理院"
@@ -318,14 +310,22 @@ def build_layout_preview(plan, size=(720, 420)):
 
 
 def generate_pdf(gpx_data: bytes, map_type='std', scale_factor=1.0, overlap=0.5,
-                 page_margin_mm=5.0, draw_magnetic_north=False, *, cache_dir=None,
+                 page_margin_mm=5.0, draw_magnetic_north=True, *, magnetic_spacing_m=1000, cache_dir=None,
                  progress_callback=None, plan=None, limits=DEFAULT_LIMITS):
-    settings = Settings(map_type, scale_factor, overlap, page_margin_mm)
+    settings = Settings(map_type, scale_factor, overlap, page_margin_mm, draw_magnetic_north, magnetic_spacing_m)
     if plan is None:
-        plan = plan_pdf(gpx_data, map_type, scale_factor, overlap, page_margin_mm, draw_magnetic_north, limits=limits)
-    elif (draw_magnetic_north or plan.settings != settings or plan.document.digest != hashlib.sha256(gpx_data).hexdigest()
+        plan = plan_pdf(gpx_data, map_type, scale_factor, overlap, page_margin_mm, draw_magnetic_north,
+                        magnetic_spacing_m=magnetic_spacing_m, limits=limits)
+    elif (plan.settings != settings or plan.document.digest != hashlib.sha256(gpx_data).hexdigest()
           or plan.limits != limits):
         raise GPX2MapError('GPXまたは設定が変更されました。生成内容を確認してやり直してください。')
+    # Calculate once at the centre of all planned maps, before any tile fetch.
+    # Keep the information legend on every page even when the lines are off.
+    center_x = (min(x for x, y in plan.grids) + max(x for x, y in plan.grids) + plan.page_w_tiles) / 2
+    center_y = (min(y for x, y in plan.grids) + max(y for x, y in plan.grids) + plan.page_h_tiles) / 2
+    magnetic_info = calculate_declination(*tile_to_latlon(center_x, center_y))
+    magnetic_grid = (MagneticGrid(magnetic_info.degrees, center_x, center_y, plan.reference_latitude,
+                                  magnetic_spacing_m, ZOOM_LEVEL) if draw_magnetic_north else None)
     margin_px = round(page_margin_mm * 300 / 25.4)
     printable_size = (TARGET_WIDTH - 2 * margin_px, TARGET_HEIGHT - 2 * margin_px)
     prepared = set()
@@ -347,8 +347,10 @@ def generate_pdf(gpx_data: bytes, map_type='std', scale_factor=1.0, overlap=0.5,
                     report('tiles', index)
             with build_map_image(gx, gy, plan.page_w_tiles, plan.page_h_tiles, map_type, session,
                                  target_size=printable_size, cache_dir=cache_dir, tile_callback=tile_ready) as printable:
+                if magnetic_grid is not None:
+                    draw_magnetic_lines(printable, magnetic_grid, gx, gy, plan.page_w_tiles, plan.page_h_tiles)
                 draw_track_and_credits(printable, plan.document.segments, gx, gy, plan.page_w_tiles, plan.page_h_tiles,
-                                       scale_factor, page_margin_mm)
+                                       scale_factor, page_margin_mm, magnetic_info)
                 # RGB pages are encoded and closed immediately; no list of raster pages.
                 with Image.new('RGB', (TARGET_WIDTH, TARGET_HEIGHT), 'white') as page:
                     page.paste(printable, (margin_px, margin_px), mask=printable.getchannel('A'))
@@ -378,7 +380,11 @@ def main(argv=None):
     parser.add_argument('-m', '--margin', type=float, default=0.5, help='ページ間の重なり（0〜1タイル）')
     parser.add_argument('-t', '--type', choices=['std', 'pale', 'seamlessphoto'], default='std')
     parser.add_argument('--page-margin', type=float, default=5.0, help='四辺の余白（0〜20mm）')
-    parser.add_argument('--draw-magnetic-north', action='store_true', help='磁北線（現在利用不可）')
+    magnetic_flags = parser.add_mutually_exclusive_group()
+    magnetic_flags.add_argument('--draw-magnetic-north', dest='draw_magnetic_north', action='store_true', help='磁北線を表示する（デフォルト）')
+    magnetic_flags.add_argument('--no-magnetic-north', dest='draw_magnetic_north', action='store_false', help='磁北線を非表示（偏角情報は表示）')
+    parser.set_defaults(draw_magnetic_north=True)
+    parser.add_argument('--magnetic-spacing', type=int, choices=SPACING_OPTIONS_M, default=1000, help='磁北線の地上間隔（m）')
     parser.add_argument('--cache-dir', help='公開タイルのキャッシュ保存先')
     args = parser.parse_args(argv)
     try:
@@ -388,7 +394,7 @@ def main(argv=None):
         with path.open('rb') as source:
             data = source.read(DEFAULT_LIMITS.input_bytes + 1)
         result = generate_pdf(data, args.type, args.scale, args.margin, args.page_margin,
-                              args.draw_magnetic_north, cache_dir=args.cache_dir)
+                              args.draw_magnetic_north, magnetic_spacing_m=args.magnetic_spacing, cache_dir=args.cache_dir)
         output = Path(args.output)
         temporary_path = None
         try:
@@ -402,8 +408,8 @@ def main(argv=None):
                 temporary_path.unlink(missing_ok=True)
         print(f'PDFを作成しました: {output}')
         return 0
-    except (GPX2MapError, OSError, requests.RequestException) as error:
-        print(f'エラー: {error}', file=sys.stderr)
+    except (GPX2MapError, MagneticNorthError, OSError, requests.RequestException) as error:
+        print(f'エラー: PDF生成に失敗しました: {error}', file=sys.stderr)
         return 1
 
 

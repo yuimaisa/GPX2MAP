@@ -6,6 +6,7 @@ import streamlit as st
 from gpx2map import build_layout_preview, generate_pdf
 from map_plan import DEFAULT_LIMITS, GPX2MapError, inspect_gpx, plan_pdf
 from tile_store import TileDownloadError
+from magnetic_north import MagneticNorthError, SPACING_OPTIONS_M
 
 st.set_page_config(page_title='GPX2MAP | 印刷用の地図を作成', layout='centered')
 
@@ -127,17 +128,28 @@ with st.container(border=True):
             help='隣のページと同じ範囲を載せます。迷った場合は「標準」を選んでください。',
             on_change=reset_generation_state, disabled=st.session_state.generating,
         )
-        st.checkbox('磁北線を追加する（現在利用できません）', value=False, disabled=True)
-        st.caption('磁北線は、信頼できる偏角の取得方法と正確性を確認できるまで利用できません。')
+        draw_magnetic_north = st.checkbox(
+            '磁北線を表示する', value=True, key='draw_magnetic_north_check',
+            on_change=reset_generation_state, disabled=st.session_state.generating,
+        )
+        magnetic_spacing_m = 1000
+        if draw_magnetic_north:
+            magnetic_spacing_m = st.selectbox(
+                '磁北線の間隔', SPACING_OPTIONS_M, index=1,
+                format_func=lambda value: {500: '500m', 1000: '1km', 2000: '2km'}[value],
+                key='magnetic_spacing_select', on_change=reset_generation_state,
+                disabled=st.session_state.generating,
+            )
     overlap = OVERLAP_OPTIONS[overlap_choice]
 
 plan, plan_error = None, None
 if document is not None:
     try:
-        plan_key = (document.digest, map_type, scale_factor, overlap, page_margin)
+        plan_key = (document.digest, map_type, scale_factor, overlap, page_margin, draw_magnetic_north, magnetic_spacing_m)
         if st.session_state.plan_key != plan_key:
             st.session_state.generation_plan = plan_pdf(
-                gpx_data, map_type, scale_factor, overlap, page_margin, document=document,
+                gpx_data, map_type, scale_factor, overlap, page_margin, draw_magnetic_north,
+                magnetic_spacing_m=magnetic_spacing_m, document=document,
             )
             st.session_state.plan_key = plan_key
         plan = st.session_state.generation_plan
@@ -193,7 +205,8 @@ with st.container(border=True):
                 status.info(messages[progress.stage])
             try:
                 pdf_bytes = generate_pdf(
-                    gpx_data, map_type, scale_factor, overlap, page_margin,
+                    gpx_data, map_type, scale_factor, overlap, page_margin, draw_magnetic_north,
+                    magnetic_spacing_m=magnetic_spacing_m,
                     progress_callback=on_progress, plan=plan,
                 )
                 st.session_state.pdf_bytes = pdf_bytes
@@ -202,7 +215,9 @@ with st.container(border=True):
                 st.session_state.pdf_summary = f'{plan.page_count}ページ / {MAP_LABELS[map_type]} / 1:{scale_denominator:,} / A4横 / 余白{page_margin:g}mm'
             except Exception as error:
                 st.session_state.pdf_bytes = None
-                if isinstance(error, TileDownloadError):
+                if isinstance(error, MagneticNorthError):
+                    st.session_state.error_message = '磁気偏角を計算できなかったため、PDFの生成に失敗しました。エラーの詳細を確認してください。'
+                elif isinstance(error, TileDownloadError):
                     st.session_state.error_message = '地図を取得できなかったため、PDFは作成していません。通信状況とエラーの詳細を確認して再試行してください。'
                 else:
                     st.session_state.error_message = 'PDFを作成できませんでした。ファイルや設定、エラーの詳細を確認して再試行してください。'

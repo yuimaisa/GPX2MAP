@@ -32,7 +32,7 @@ class DeploymentTests(unittest.TestCase):
         stage_payload(self.source, target)
         files = {p.relative_to(target).as_posix() for p in target.rglob('*') if p.is_file()}
         self.assertEqual(files, set(DEPLOY_FILES))
-        self.assertEqual(len(files), 11)
+        self.assertEqual(len(files), 12)
         for name in ('assets/NotoSansJP-Regular.otf', 'assets/OFL.txt'):
             self.assertEqual((target / name).read_bytes(), (self.source / name).read_bytes())
         self.assertFalse((target / '.git').exists())
