@@ -151,6 +151,18 @@ python scripts/check_memory.py
 
 GitHub Actionsはプルリクエストとmainへのpushで単体・統合テストとブラウザ検証を実行します。両方が成功したmainへのpushだけが、既存の `HF_TOKEN` シークレットでHugging Face Spacesへ同期されます。PRのブランチpushではデプロイしません。Spaces側はREADME先頭のPython 3.12・Streamlit 1.66.0と、固定された依存関係を使用します。
 
+デプロイはテストと同じコミットをチェックアウトし、デプロイ専用の `requirements-deploy.txt` をインストールして `scripts/deploy_space.py` を実行します。`HfApi.upload_folder()` が `yuishin/gpx2map` に配布し、バイナリの処理はSDKに任せます。一時Gitリポジトリや通常の `git push` は使いません。
+
+配布対象は実行用Python 4ファイル、`requirements.txt`、README、アプリのLICENSE、`.streamlit/config.toml`、日本語フォント、OFL、フォント説明の11ファイルです。明示したファイルだけを配布フォルダへコピーし、必須ファイルの欠落やフォントのGit LFSポインターを検出すると送信前に失敗します。`.git`、`.github`、テスト、キャッシュ、仮想環境、デプロイ用SDKは含めません。既存のSpace上のファイルを一括削除する処理は行いません。
+
+配布対象の確認は、トークンや外部通信なしで実行できます。
+
+```bash
+python scripts/deploy_space.py --dry-run
+```
+
+`HF_TOKEN` はアップロードのステップだけでGitHub Secretsから受け取り、SDKへ渡します。トークンを含むURLや例外の詳細はログに出力しません。実アップロードには、既存のSpaceへ書き込めるトークンが必要です。
+
 単体・統合テストに加え、CIで50,000点・24ページの合成データによるメモリ確認も実行します。
 
 初回公開前にはSpacesのビルドと起動、実地図の取得、対象環境でのメモリ使用量を確認してください。今回の改善で外部サービスの資格情報やリポジトリの権限設定を変更する必要はありません。
