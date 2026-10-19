@@ -2,6 +2,7 @@
 *.pdf
 *.png
 *.jpg
+*.zip
 __pycache__/
 tile_cache/
 fonts/

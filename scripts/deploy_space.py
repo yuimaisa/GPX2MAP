@@ -14,6 +14,8 @@ DEPLOY_FILES = (
     'map_plan.py',
     'magnetic_north.py',
     'tile_store.py',
+    'pdf_output.py',
+    'download_component.py',
     'requirements.txt',
     'README.md',
     'LICENSE',

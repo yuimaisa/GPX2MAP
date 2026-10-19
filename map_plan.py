@@ -314,9 +314,9 @@ def plan_pdf(gpx_data, map_type='std', scale_factor=1.0, overlap=0.5, page_margi
     scale_error = max(abs(math.cos(math.radians(lat)) / math.cos(math.radians(reference_lat)) - 1) for lat in latitudes)
     if scale_error > 0.01:
         raise ResourceLimitError('南北の範囲が広く、縮尺の誤差が1%を超えます。対象区間を分けてください。')
-    # Three 4-byte Pillow page buffers, two bounded compressed-PDF buffers,
-    # and 64 MiB for GPX objects, tiles, encoders and a conservative margin.
-    estimate = TARGET_WIDTH * TARGET_HEIGHT * 4 * 3 + limits.pdf_bytes * 2 + 64 * 1024**2
+    # Three 4-byte Pillow page buffers plus 64 MiB for GPX/tiles/encoders.
+    # JPEG/PDF/ZIP bytes are copied between disk files in bounded blocks.
+    estimate = TARGET_WIDTH * TARGET_HEIGHT * 4 * 3 + 64 * 1024**2
     if estimate > limits.memory_bytes:
         raise ResourceLimitError('推定メモリ使用量が上限を超えます。実行環境の設定を確認してください。')
     return GenerationPlan(document, settings, tuple(grids), width, height, tuple(sorted(tiles)), reference_lat, scale_error, estimate, limits)

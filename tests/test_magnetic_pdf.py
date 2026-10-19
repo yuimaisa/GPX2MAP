@@ -98,9 +98,9 @@ class MagneticUITests(unittest.TestCase):
             self.assertEqual(app.selectbox(key='magnetic_spacing_select').value, 1000)
             self.assertEqual(app.selectbox(key='magnetic_spacing_select').options, ['500m', '1km', '2km'])
             app.button(key='generate_button').click().run(timeout=20)
-            self.assertIsNotNone(app.session_state.pdf_bytes)
+            self.assertIsNotNone(app.session_state.download_artifact)
             app.selectbox(key='magnetic_spacing_select').set_value(500).run()
-            self.assertIsNone(app.session_state.pdf_bytes)
+            self.assertIsNone(app.session_state.download_artifact)
             self.assertEqual(app.session_state.generation_plan.settings.magnetic_spacing_m, 500)
             app.checkbox(key='draw_magnetic_north_check').uncheck().run()
             self.assertFalse(any(widget.key == 'magnetic_spacing_select' for widget in app.selectbox))
@@ -117,7 +117,7 @@ class MagneticUITests(unittest.TestCase):
         self.assertIn('PDFの生成に失敗', app.error[0].value)
         self.assertIn('WMM coefficients unavailable', app.session_state.error_details)
         self.assertFalse(app.success)
-        self.assertIsNone(app.session_state.pdf_bytes)
+        self.assertIsNone(app.session_state.download_artifact)
         self.assertFalse(app.get('download_button'))
 
 
