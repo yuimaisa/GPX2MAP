@@ -192,7 +192,7 @@ def draw_track_and_credits(image, tracks_points, grid_x, grid_y, page_w_tiles, p
     draw.rectangle(bg_coords, fill=(255, 255, 255, 180), outline=(200, 200, 200, 255), width=1)
     
     # クレジットテキスト描画
-    draw.text((tx, ty), credit_text, fill=(50, 50, 50, 255), font=font_large)
+    draw.text((tx, ty), credit_text, fill=(50, 50, 50, 255), font=font_large, anchor="lt")
 
     # 左下の縮尺とスケールバーの算出と描画
     # 縮尺比率の算出
@@ -270,13 +270,13 @@ def draw_track_and_credits(image, tracks_points, grid_x, grid_y, page_w_tiles, p
     # 1. 縮尺値テキスト描画
     scale_x = box_left + left_padding
     scale_y = box_top + left_padding
-    draw.text((scale_x, scale_y), scale_text, fill=(50, 50, 50, 255), font=font_large)
+    draw.text((scale_x, scale_y), scale_text, fill=(50, 50, 50, 255), font=font_large, anchor="lt")
     
     # 2. スケールバーテキスト描画 (中央揃え)
     bar_center_x = box_left + left_padding + bar_px / 2
     bar_text_x = bar_center_x - bar_text_w / 2
     bar_text_y = scale_y + scale_h + 10
-    draw.text((bar_text_x, bar_text_y), bar_text, fill=(50, 50, 50, 255), font=font_medium)
+    draw.text((bar_text_x, bar_text_y), bar_text, fill=(50, 50, 50, 255), font=font_medium, anchor="lt")
     
     # 3. スケールバーの線描画
     bar_line_y = bar_text_y + bar_text_h + 5
